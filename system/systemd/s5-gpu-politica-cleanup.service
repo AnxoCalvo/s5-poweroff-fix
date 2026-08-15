@@ -1,0 +1,37 @@
+[Unit]
+Description=Borra la entrada de GRUB de un solo uso que dejo s5-gpu-politica
+# SIN ConditionPathExists, Y NO ES UN DESCUIDO. Aqui habia dos:
+#
+#     ConditionPathExists=|/boot/grub2/custom.cfg
+#     ConditionPathExists=|/boot/grub/custom.cfg
+#
+# o sea los dos sabores (Fedora/RHEL/SUSE y Debian/Ubuntu/Arch) con el `|` que
+# los convierte en un *O*. Como atajo funcionaba: el 99% de los arranques la
+# unidad ni se activaba. El problema es lo que pasaba en el 1% restante cuando
+# el usuario fija S5_GRUB_DIR en /etc/s5-poweroff-fix.conf —una perilla
+# documentada— a un directorio que no es ninguno de esos dos.
+#
+# QUIEN ESCRIBE LA ENTRADA SI OBEDECE A LA PERILLA: s5-gpu-politica la pone en
+# el $GRUB_CUSTOM que le da s5-descubre-grub. Y quien la barre tambien
+# (s5-gpu-politica-cleanup vuelve a sourcear el descubridor). El unico eslabon
+# que no podia obedecerla era esta condicion, porque un fichero de unidad no
+# lee configuracion: systemd no activaba la unidad, el script no llegaba a
+# correr, y el custom.cfg se quedaba en el menu para siempre.
+#
+# UNA CONDICION QUE ES UNA OPTIMIZACION NO PUEDE DECIDIR LA CORRECCION. El
+# script ya hace de guarda barata —sourcea el descubridor, y si no hay
+# $GRUB_CUSTOM o no existe el fichero sale con 0 sin tocar nada— asi que lo
+# unico que se pierde quitando la condicion son unos milisegundos de un oneshot
+# por arranque. Lo que se gana es que el barrido funcione en TODAS las
+# configuraciones que el .conf de ejemplo dice que se admiten.
+#
+# `After=local-fs.target` si hace falta: sin /boot montado no hay nada que ver.
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/s5-gpu-politica-cleanup
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target

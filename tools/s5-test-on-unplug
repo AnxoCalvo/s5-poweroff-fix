@@ -1,0 +1,52 @@
+#!/bin/bash
+# Espera a que se desenchufe el cargador y lanza la prueba indicada.
+#
+#   s5-test-on-unplug [-c CMD] [-w SEG] ARGS...
+#
+# Por defecto CMD=/usr/local/bin/s5-test (compatible con el uso anterior) y
+# SEG=900 (15 min). Con -w 0 espera SIN LIMITE: util para armar una ronda y
+# desenchufar cuando a uno le venga bien. Ejemplos:
+#   s5-test-on-unplug -c /usr/local/bin/s5-grub-halt -m 20
+#   s5-test-on-unplug -w 0 -c /usr/local/bin/s5-queue next
+set -u
+
+CMD=/usr/local/bin/s5-test
+WAIT=900
+
+while :; do
+    case "${1:-}" in
+        -c) CMD=${2:?-c necesita un valor}; shift 2 ;;
+        -w) WAIT=${2:?-w necesita un valor}; shift 2 ;;
+        *)  break ;;
+    esac
+done
+case "$WAIT" in ''|*[!0-9]*) echo "s5-test-on-unplug: -w tiene que ser un entero" >&2; exit 1 ;; esac
+
+# Devuelve 0 si el equipo esta A BATERIA. Si no hay ningun adaptador legible no
+# se inventa nada: devuelve 1 (o sea "sigue enchufado") y esta herramienta acaba
+# agotando su espera con un mensaje, en vez de lanzar la prueba a ciegas.
+desenchufado() {
+    for a in /sys/class/power_supply/AC* /sys/class/power_supply/ADP*; do
+        [ -r "$a/online" ] && { [ "$(cat "$a/online")" = 0 ]; return; }
+    done
+    return 1
+}
+
+[ "$WAIT" = 0 ] && logger -t s5-test-on-unplug "esperando SIN LIMITE a que se desenchufe para lanzar $CMD $*"
+
+i=0
+while [ "$WAIT" = 0 ] || [ "$i" -lt "$WAIT" ]; do
+    # ACAD ES EL NOMBRE DEL ADAPTADOR DE UNA MAQUINA CONCRETA. En otras es AC,
+    # AC0, ADP0 o ADP1: el `cat` fallaba, el 2>/dev/null se lo tragaba, la
+    # comparacion ""=0 salia falsa y esta herramienta NO DISPARABA NUNCA — se
+    # comia su timeout en silencio, que es como prohibe fallar la regla 11.
+    # Mismo bucle que s5-test, s5-grub-halt y s5-energy-log.
+    if desenchufado; then
+        logger -t s5-test-on-unplug "cargador desconectado: lanzando $CMD $*"
+        sleep 3
+        exec "$CMD" "$@"
+    fi
+    sleep 1
+    i=$((i + 1))
+done
+logger -t s5-test-on-unplug "$WAIT s sin desenchufar: cancelo el lanzamiento de $CMD"

@@ -1,0 +1,12 @@
+[Unit]
+Description=s5-test: anota el resultado de la prueba tras despertar del S5
+After=s5-energy-log.service
+Requires=s5-energy-log.service
+ConditionPathExists=/var/lib/s5-test/pending
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/s5-test --report
+
+[Install]
+WantedBy=multi-user.target

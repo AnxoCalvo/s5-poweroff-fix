@@ -1,0 +1,78 @@
+#!/bin/bash
+# Registra el nivel de energia de la bateria al arrancar y al apagar, para medir
+# el consumo real del equipo estando "apagado" (S5). Ver s5-energy-log.service.
+#
+# Uso:  s5-energy-log boot | shutdown
+# Log:  /var/log/s5-energy.log
+
+set -u
+
+LOG=/var/log/s5-energy.log
+STATE=/var/lib/s5-energy/last-shutdown
+event="${1:-}"
+
+# S5_BAT TIENE QUE LLEGAR HASTA AQUI. Este script es el medidor principal —lo que
+# escribe en $LOG es la base de evidencia y lo que lee el verificador— y era el
+# unico que NO respetaba la perilla: el hook 99, s5-grub-halt y s5-state-dump si.
+# En un portatil de dos baterias el usuario fijaba S5_BAT, el hook obedecia y el
+# medidor no, con lo que los dos testigos leian CELDAS DISTINTAS y la aritmetica
+# de Wh entre apagado y arranque no significaba nada.
+S5_CONF=${S5_CONF:-/etc/s5-poweroff-fix.conf}
+# shellcheck source=/dev/null
+[ -r "$S5_CONF" ] && . "$S5_CONF"
+
+bat="${S5_BAT:-$(ls -d /sys/class/power_supply/BAT* 2>/dev/null | head -1)}"
+[ -n "$bat" ] || exit 0
+
+now=$(date +%s)
+stamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+# energy_now viene en microvatios-hora; si el equipo solo expone carga, se convierte
+if [ -r "$bat/energy_now" ]; then
+    e_uwh=$(cat "$bat/energy_now")
+elif [ -r "$bat/charge_now" ] && [ -r "$bat/voltage_now" ]; then
+    e_uwh=$(( $(cat "$bat/charge_now") * $(cat "$bat/voltage_now") / 1000000 ))
+else
+    exit 0
+fi
+
+cap=$(cat "$bat/capacity" 2>/dev/null || echo '?')
+st=$(cat "$bat/status" 2>/dev/null || echo '?')
+
+ac=desconocido
+for a in /sys/class/power_supply/AC* /sys/class/power_supply/ADP*; do
+    if [ -r "$a/online" ]; then
+        if [ "$(cat "$a/online")" = 1 ]; then ac=enchufado; else ac=bateria; fi
+        break
+    fi
+done
+
+wh=$(awk -v v="$e_uwh" 'BEGIN{printf "%.3f", v/1000000}')
+
+if [ "$event" = shutdown ]; then
+    mkdir -p "$(dirname "$STATE")"
+    printf '%s %s %s\n' "$now" "$e_uwh" "$ac" > "$STATE"
+    printf '%s  APAGADO   %8s Wh  %3s%%  %-11s  (%s)\n' \
+        "$stamp" "$wh" "$cap" "$st" "$ac" >> "$LOG"
+    exit 0
+fi
+
+printf '%s  ARRANQUE  %8s Wh  %3s%%  %-11s  (%s)\n' \
+    "$stamp" "$wh" "$cap" "$st" "$ac" >> "$LOG"
+
+# Si hay un apagado previo registrado, calcular cuanto consumio mientras estuvo apagado
+if [ -r "$STATE" ]; then
+    read -r p_ts p_uwh p_ac < "$STATE"
+    dt=$(( now - p_ts ))
+    if [ "$dt" -gt 0 ]; then
+        awk -v d="$(( p_uwh - e_uwh ))" -v s="$dt" -v ac="$p_ac" 'BEGIN {
+            h  = s / 3600
+            wh = d / 1000000
+            if (ac == "bateria")
+                printf "          => APAGADO %.2f h a bateria: %+.3f Wh  =  %.2f W medios en S5\n", h, -wh, wh/h
+            else
+                printf "          => APAGADO %.2f h enchufado: %+.3f Wh (cargando; el vataje no es medible asi)\n", h, -wh
+        }' >> "$LOG"
+    fi
+    rm -f "$STATE"
+fi

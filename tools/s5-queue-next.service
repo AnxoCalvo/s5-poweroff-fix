@@ -1,0 +1,13 @@
+[Unit]
+Description=s5-queue: lanza la siguiente prueba de consumo en S5 de la cola
+After=s5-test-report.service s5-energy-log.service multi-user.target
+ConditionPathExists=/var/lib/s5-test/queue
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/s5-queue next
+TimeoutStartSec=1200
+StandardOutput=journal
+
+[Install]
+WantedBy=multi-user.target

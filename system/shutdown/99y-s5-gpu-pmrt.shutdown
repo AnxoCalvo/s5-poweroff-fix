@@ -1,0 +1,331 @@
+#!/bin/bash
+# /usr/lib/systemd/system-shutdown/99y-s5-gpu-pmrt.shutdown
+#
+# LA MITIGACION PERMANENTE del drenaje en S5 (dGPU NVIDIA, ~18-20 W).
+# Este hook NO APAGA: blinda el subarbol de la discreta y deja que systemd
+# apague por el camino NORMAL (con _PTS(5) y con device_shutdown()).
+#
+# Lo que blinda, y por que, en dos lineas:
+#   (a) `pm_runtime_resume()` de pci_device_shutdown() -> rebota con -EACCES
+#       gracias a __pm_runtime_disable(dev,false). Validado en caliente en el
+#       paso 0 (2026-08-10 20:26): D3cold intacto, rc=-13, delta activo_ms = 0.
+#   (b) `drv->shutdown()` de nvidia (nv_pci_shutdown -> nv_pci_remove_helper,
+#       o sea el teardown que el ensayo de las 18:56 vio DESPERTAR el subarbol)
+#       -> puesto a NULL. Saltarselo reduce el riesgo: la alternativa es
+#       ejecutarlo contra una GPU sin alimentar.
+#
+# MEDIDO, n=3 (2026-08-10): 1,77 / 2,04 / 2,00 W  frente a 18-24 W sin blindar.
+# Sin secuelas en el arranque siguiente en las tres replicas.
+#
+# MODO PERMANENTE (2026-08-11): ya NO hace falta armarlo. Actua en todo
+# `poweroff`. Para desactivarlo puntualmente — p.ej. para medir una linea base
+# SIN mitigacion — crear el fichero de freno:
+#       sudo touch /var/lib/s5-test/gpu-pmrt-disabled
+# y borrarlo para volver a protegerlo. El freno deja testigo en el log: no hay
+# forma de quedarse sin mitigacion en silencio.
+#
+# EL MODULO VIENE DEL AKMOD (2026-08-10): `akmod-s5-pmrt-arm` lo recompila solo
+# con cada kernel nuevo y lo deja en /lib/modules/<version>/extra/s5-pmrt-arm/.
+# Por eso aqui se carga con `modprobe`, no con `insmod` sobre una ruta fija: el
+# .ko compilado a mano lleva el vermagic del kernel con el que se compilo y tras
+# un `dnf update` la mitigacion moriria en silencio (regla 11). Se conserva como
+# respaldo. Comprobar el estado del akmod: `s5-mitigacion-check`.
+#
+# S5_PMRT_DRYRUN=1 lo prueba en caliente: insmod con arm=0 (no toca nada), los
+# logs desviados y SIN remontar / (ni rw ni ro), que en una maquina viva es lo
+# unico de aqui que podia hacer dano. Ensayarlo bajo systemd-run, NUNCA con
+# sudo: el dominio SELinux depende de quien llama y un EPERM silencioso se lee
+# como exito.
+
+# OVERRIDE DE PARAMETROS, SOLO PARA EXPERIMENTOS (2026-08-11).
+# Permite cargar el modulo con otros parametros en UN apagado concreto, p.ej.
+# `noshut=ninguno` para medir la mitad (a) del blindaje sin la (b).
+#
+# NO PUEDE FILTRARSE A APAGADOS FUTUROS, y esto es deliberado: el fichero lleva
+# en su primera linea el `boot_id` del arranque para el que vale, y el hook lo
+# ignora si no casa con el vivo. Asi no hace falta borrarlo al apagar — que es
+# justo la operacion que la regla 18 dice que falla en silencio con / en ro.
+# Un fichero olvidado queda inerte en cuanto se reinicia.
+#
+#   linea 1: boot_id (de /proc/sys/kernel/random/boot_id)
+#   linea 2: parametros extra para modprobe/insmod
+#
+# Nadie lo escribe en este repo: es un gancho para depurar a mano (se creo para
+# aislar la mitad (a) del blindaje, un arnes que NO se publica — ver
+# docs/EVIDENCE.md). Deje o no deje huella, SIEMPRE hay testigo en el log:
+# ACTIVO, IGNORADO o nada en absoluto.
+OVERRIDE=/var/lib/s5-test/pmrt-params-override
+
+ACTION="$1"
+DISABLE=/var/lib/s5-test/gpu-pmrt-disabled
+LEGACYFLAG=/var/lib/s5-test/gpu-pmrt-armed
+PM1AFLAG=/var/lib/s5-test/gpu-pm1a-armed
+PM1AHOOK=/usr/lib/systemd/system-shutdown/99z-s5-gpu-pm1a.shutdown
+MODNAME=s5_pmrt_arm
+# $KO (respaldo opcional para insmod) se asigna MAS ABAJO, despues de leer la
+# configuracion: sale de ella y aqui arriba todavia no esta cargada.
+LOG=/var/log/s5-shutdown-pci.log
+ELOG=/var/log/s5-energy.log
+DESCUBRE=${S5_DESCUBRE:-/usr/local/bin/s5-descubre-dgpu}   # overridable SOLO para ensayar (regla 22)
+MAXWAIT=20
+POLL=0.5
+
+DRYRUN="${S5_PMRT_DRYRUN:-0}"
+if [ "$DRYRUN" = 1 ]; then
+    LOG="${S5_PMRT_LOG:-/tmp/pmrt-dryrun-shutdown-pci.log}"
+    ELOG="${S5_PMRT_ELOG:-/tmp/pmrt-dryrun-energy.log}"
+fi
+ARMVAL=1
+[ "$DRYRUN" = 1 ] && ARMVAL=0
+
+[ "$ACTION" = poweroff ] || exit 0
+
+rd() { local v=''; [ -r "$1" ] || { printf '?'; return; }; read -r v < "$1" 2>/dev/null; printf '%s' "${v:-?}"; }
+estado() {
+    printf 'dGPU=%s/%s audio=%s/%s puente=%s/%s' \
+        "$(rd /sys/bus/pci/devices/$GPU/power_state)"    "$(rd /sys/bus/pci/devices/$GPU/power/runtime_status)" \
+        "$(rd /sys/bus/pci/devices/$AUDIO/power_state)"  "$(rd /sys/bus/pci/devices/$AUDIO/power/runtime_status)" \
+        "$(rd /sys/bus/pci/devices/$BRIDGE/power_state)" "$(rd /sys/bus/pci/devices/$BRIDGE/power/runtime_status)"
+}
+# REMONTAR / SOLO EN UN APAGADO DE VERDAD. En el apagado / esta en ro y hay que
+# abrirlo para escribir (regla 18). Pero la cabecera de este fichero anuncia un
+# ENSAYO EN CALIENTE (S5_PMRT_DRYRUN=1), y ahi la maquina esta VIVA: ese mismo
+# `remount,ro` iba a intentar dejarle el sistema de ficheros en solo lectura a
+# quien ensaya. Suele fallar con EBUSY y el `2>/dev/null` se lo traga, pero
+# "suele" no es una garantia y el fallo seria el escritorio de otro.
+#
+# El hook hermano (99-s5-pci-state) ya se guardaba de esto con estas dos mismas
+# funciones y lo dice en su cabecera; aqui las escrituras iban con el `mount`
+# clavado dentro de anota() y limpia_legacy(). O sea que la trampa estaba puesta
+# POR ESCRITO: el modo de ensayo lo documenta este mismo fichero y era el unico
+# de los dos que no lo respetaba.
+rw() { if [ "$DRYRUN" = 1 ]; then return 0; fi; mount -o remount,rw / 2>/dev/null; }
+ro() { if [ "$DRYRUN" = 1 ]; then return 0; fi; mount -o remount,ro / 2>/dev/null; }
+
+anota() {   # anota <fichero> <texto...>   — / esta en ro aqui (regla 18)
+    local f="$1"; shift
+    rw
+    printf '%s\n' "$@" >> "$f" 2>/dev/null
+    sync
+    ro
+}
+limpia_legacy() {   # el flag de armado ya no gobierna nada; si quedo uno viejo,
+                    # consumirlo CON el fs en rw y DEJAR TESTIGO (regla 18)
+    local ok
+    [ -e "$LEGACYFLAG" ] || return 0
+    rw
+    rm -f "$LEGACYFLAG" 2>/dev/null
+    sync
+    if [ -e "$LEGACYFLAG" ]; then ok=NO; else ok=SI; fi
+    printf '%s\n' "PMRT flag de armado OBSOLETO encontrado y borrado=$ok ($LEGACYFLAG)" >> "$LOG" 2>/dev/null
+    sync
+    ro
+}
+
+# ---------------------------------------------------------------------------
+# QUE SE BLINDA. Antes estaba clavado arriba (GPU=0000:01:00.0 y compania), que
+# es correcto en la maquina donde se midio y PELIGROSO en cualquier otra:
+# blindaria lo que hubiera en esa ruta, que puede ser el NVMe. Ahora sale de
+# sysfs — ver s5-descubre-dgpu, que deja GPU, AUDIO, BRIDGE y S5_DEVS.
+#
+# VA AQUI, ANTES DEL FRENO, y no mas abajo: estaba despues, y el testigo del
+# freno —`PMRT estado sin blindar: $(estado)`— se escribia con $GPU todavia
+# vacia, o sea leyendo `/sys/bus/pci/devices//power_state`, que no existe. Salia
+# `dGPU=?/? audio=?/? puente=?/?` en todos los apagados con el freno puesto: un
+# testigo que no mide nada, justo en la unica rama que deja el equipo sin
+# mitigacion, y de la que este fichero promete que nunca pasa en silencio.
+# Sourcear el descubridor no toca ningun dispositivo (solo define variables),
+# asi que adelantarlo no cambia nada mas.
+GPU=''; AUDIO=''; BRIDGE=''; S5_DEVS=''
+# shellcheck source=/dev/null
+[ -r "$DESCUBRE" ] && . "$DESCUBRE"
+
+# ---------------------------------------------------------------------------
+# FRENO DE MANO. Unica forma de quedarse sin mitigacion, y nunca en silencio.
+if [ -e "$DISABLE" ]; then
+    anota "$LOG" \
+        "" \
+        "===== $(date '+%F %T')  PASO 1 (pmrt)  DESACTIVADO POR FRENO  accion=$ACTION" \
+        "PMRT FRENO: existe $DISABLE => NO se blinda. Este apagado gastara ~18-20 W en S5." \
+        "PMRT estado sin blindar: $(estado)"
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# EXCLUSION MUTUA con el arnes de PM1a. Se retiro el 2026-08-11, pero si alguien
+# lo reinstala Y lo arma, los dos hooks correrian EN PARALELO (systemd-shutdown
+# ejecuta este directorio en paralelo, no por orden alfabetico — lo dice tambien
+# la cabecera de 99-s5-pci-state.shutdown, donde se midio) y el
+# 99z apagaria escribiendo PM1a_CNT: saldrian ~2 W por el camino viejo y se
+# leerian como exito de la via limpia. Se exige el hook ADEMAS del flag para que
+# un flag huerfano no deje el equipo sin mitigacion.
+if [ -e "$PM1AFLAG" ] && [ -x "$PM1AHOOK" ]; then
+    anota "$LOG" \
+        "" \
+        "===== $(date '+%F %T')  PASO 1 (pmrt)  ABORTADO  accion=$ACTION" \
+        "PMRT ABORTADO: el arnes de PM1a esta reinstalado ($PM1AHOOK) y armado ($PM1AFLAG);" \
+        "PMRT   el 99z apagaria por PM1a_CNT y la medida seria ambigua. Retirar uno de los dos."
+    limpia_legacy
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# SI NO HAY dGPU NO SE IMPROVISA. Falta el descubridor (sourceado mas arriba), o
+# esta maquina no lleva discreta del vendor buscado: se registra y el apagado
+# sigue su curso normal. Ese S5 costara ~18-20 W, que es infinitamente preferible
+# a blindar el dispositivo equivocado — y queda ESCRITO para que
+# `s5-mitigacion-check` lo cante en el arranque siguiente (regla 11: esto no
+# puede morir en silencio).
+#
+# Va DESPUES del freno y de la exclusion mutua a proposito: si el freno esta
+# puesto no se blinda nada de todas formas, y ese testigo es mas informativo que
+# este.
+if [ -z "$GPU" ]; then
+    anota "$LOG" \
+        "" \
+        "===== $(date '+%F %T')  PASO 1 (pmrt: disable+noshutdown)  accion=$ACTION  ABORTADO" \
+        "PMRT !!! sin dGPU que blindar: $([ -r "$DESCUBRE" ] && echo 's5-descubre-dgpu no encontro ninguna' || echo "falta $DESCUBRE")" \
+        "PMRT !!! no se toca nada; este apagado sera normal y puede costar ~18-20 W"
+    anota "$ELOG" "###   !!! PASO 1 (pmrt): sin dGPU localizada => apagado SIN blindaje, S5 caro probable"
+    exit 0
+fi
+
+# RESPALDO OPCIONAL de `insmod`: un `.ko` suelto compilado a mano, por si el
+# `modprobe` del akmod falla. VACIO POR DEFECTO a proposito — antes traia clavada
+# la ruta de la maquina donde se diagnostico esto, que en cualquier otra no
+# existe y solo servia para confundir a quien leyera el codigo.
+#
+# Va AQUI, no arriba con las demas constantes, porque sale de la configuracion y
+# es el `.` del descubridor de arriba el que la carga.
+#
+# El camino normal es el akmod, que ademas es el unico que sobrevive a una
+# actualizacion de kernel. Si aun asi quieres una red debajo, pon la ruta en
+# S5_KO_RESPALDO= dentro de /etc/s5-poweroff-fix.conf — y recuerda que ese .ko
+# deja de valer en cuanto cambie el kernel; por eso no es el mecanismo principal.
+KO="${S5_KO_RESPALDO:-}"
+
+# ---------------------------------------------------------------------------
+# RESOLUCION DEL OVERRIDE. Se hace ANTES de anunciar nada, para que la linea que
+# anuncia el modprobe diga los parametros DE VERDAD (regla 16).
+EXTRA=''
+OVTESTIGO=''
+if [ -r "$OVERRIDE" ]; then
+    ov_boot=''; ov_par=''
+    { read -r ov_boot; read -r ov_par; } < "$OVERRIDE" 2>/dev/null
+    boot_vivo="$(rd /proc/sys/kernel/random/boot_id)"
+    if [ -n "$ov_boot" ] && [ "$ov_boot" = "$boot_vivo" ]; then
+        EXTRA="$ov_par"
+        OVTESTIGO="PMRT PARAMS OVERRIDE ACTIVO: '$EXTRA'  (boot_id casa: $ov_boot)"
+    else
+        OVTESTIGO="PMRT PARAMS OVERRIDE IGNORADO: es de otro arranque ('$ov_boot' != '$boot_vivo') => parametros por defecto"
+    fi
+fi
+
+# espera acotada a que la dGPU baje a D3cold: nunca puede colgar el apagado
+t=0
+while [ "$(rd /sys/bus/pci/devices/$GPU/power_state)" != D3cold ]; do
+    awk -v t="$t" -v m="$MAXWAIT" 'BEGIN{exit !(t>=m)}' && break
+    sleep "$POLL"
+    t=$(awk -v t="$t" -v p="$POLL" 'BEGIN{printf "%.1f", t+p}')
+done
+
+anota "$LOG" \
+    "" \
+    "===== $(date '+%F %T')  PASO 1 (pmrt: disable+noshutdown)  accion=$ACTION  dryrun=$DRYRUN" \
+    "PMRT MODO=permanente (no requiere armado; freno en $DISABLE)" \
+    "PMRT TESTIGO justo antes de blindar: $(estado)  (espera ${t}s)"
+
+# Fuera del bloque de arriba a proposito: si no hay override, el log de un
+# apagado normal queda EXACTAMENTE igual que antes y `s5-mitigacion-check` lo
+# sigue leyendo sin cambios.
+[ -n "$OVTESTIGO" ] && anota "$LOG" "$OVTESTIGO"
+
+# Si la espera vencio y la dGPU NO esta en D3cold, blindarla la CONGELA DESPIERTA
+# y el S5 costara ~18-20 W. Es el unico modo de fallo que gasta bateria de
+# verdad, asi que se anuncia como aviso, no como linea de tramite.
+if [ "$(rd /sys/bus/pci/devices/$GPU/power_state)" != D3cold ]; then
+    anota "$LOG" \
+        "PMRT !!! AVISO: la dGPU NO llego a D3cold en ${MAXWAIT}s. Se blinda igualmente" \
+        "PMRT !!! (pci_device_shutdown la despertaria de todos modos), pero este apagado" \
+        "PMRT !!! puede gastar ~18-20 W. Mirar quien la tenia ocupada."
+    anota "$ELOG" \
+        "###   !!! PASO 1 (pmrt): la dGPU no bajo a D3cold antes de blindar => S5 caro probable"
+fi
+
+# Anunciar ANTES de actuar (regla 16): si algo cuelga, la ultima linea del log
+# dice quien fue.
+anota "$ELOG" \
+    "###   PASO 1 (pmrt): modprobe s5_pmrt_arm arm=$ARMVAL devs=$S5_DEVS $EXTRA (respaldo: insmod) — apagado NORMAL de systemd" \
+    "###     detalle en $LOG"
+
+# CARGA DEL MODULO — akmod primero, .ko a mano como respaldo.
+#
+# El akmod (`modprobe`) es el que SOBREVIVE A LAS ACTUALIZACIONES DE KERNEL:
+# akmods lo recompila e instala en /lib/modules/<version>/extra/s5-pmrt-arm/ en
+# cuanto entra un kernel nuevo. Un .ko compilado a mano lleva el vermagic del
+# kernel con el que se compilo, asi que tras un `dnf update` insmod lo rechaza y
+# la mitigacion moriria EN SILENCIO (regla 11). Ojo: el akmod instala el modulo
+# COMPRIMIDO (.ko.xz) y `insmod` NO sabe cargarlo — de ahi que la via principal
+# tenga que ser `modprobe`.
+#
+# El respaldo se conserva por si akmods no llego a construir para este kernel.
+#
+# TRAMPA QUE HAY QUE DESACTIVAR ANTES (encontrada el 2026-08-11 al preparar la
+# publicacion). `modprobe` de un modulo YA CARGADO devuelve 0 sin volver a
+# ejecutar su init — o sea SIN BLINDAR NADA— y aqui abajo se registraria
+# `insmod rc=0`, que se lee como exito. Todo el trabajo de este modulo esta en
+# el init: cargarlo es la accion.
+#
+# No es teorico: un ensayo en caliente (S5_PMRT_DRYRUN=1) deja el modulo cargado
+# con arm=0, y si luego se apaga sin reiniciar, ese S5 cuesta ~18-20 W con el log
+# en verde. Es exactamente el fallo silencioso que la regla 11 prohibe.
+#
+# Se descarga primero para que el init vuelva a correr de verdad. Si no se
+# dejara descargar, se dice en el log en vez de fingir que todo va bien.
+if [ -d "/sys/module/$MODNAME" ]; then
+    rmmod "$MODNAME" 2>/dev/null
+    if [ -d "/sys/module/$MODNAME" ]; then
+        anota "$LOG" \
+            "PMRT !!! $MODNAME ya estaba cargado y NO se deja descargar: el modprobe de abajo" \
+            "PMRT !!! devolvera 0 sin re-ejecutar su init => NO se blinda nada y este S5 sera caro."
+    else
+        anota "$LOG" "PMRT $MODNAME ya estaba cargado (¿ensayo en seco sin reiniciar?); descargado para que el init vuelva a correr"
+    fi
+fi
+
+# `devs=` va SIEMPRE explicito, con lo descubierto: el modulo trae una lista por
+# defecto que es la de la maquina de referencia, y confiar en ella seria el
+# mismo fallo que tener los BDF clavados aqui. Va ANTES de $EXTRA para que un
+# override manual pueda ponerle otro `devs=` y gane (el kernel se queda con el
+# ultimo valor de un module_param repetido).
+via=akmod
+out="$(modprobe "$MODNAME" arm=$ARMVAL devs="$S5_DEVS" $EXTRA 2>&1)"; rc=$?
+if [ "$rc" != 0 ]; then
+    # El respaldo es OPCIONAL y normalmente no existe. Sin esta guarda se
+    # llamaria a `insmod ''`, que falla con un error sobre un fichero vacio y
+    # tapa el error de verdad — el del modprobe, que es el que hay que leer.
+    if [ -n "$KO" ] && [ -r "$KO" ]; then
+        out2="$(insmod "$KO" arm=$ARMVAL devs="$S5_DEVS" $EXTRA 2>&1)"; rc2=$?
+        via="RESPALDO-insmod(akmod fallo)"
+        out="modprobe rc=$rc '$out' || insmod rc=$rc2 '$out2'"
+        rc=$rc2
+    else
+        via="akmod FALLO y no hay respaldo"
+        out="modprobe rc=$rc '$out'${KO:+ ; respaldo '$KO' ilegible}"
+    fi
+fi
+
+anota "$LOG" \
+    "PMRT insmod rc=$rc  via=$via  stderr='$out'" \
+    "PMRT estado tras blindar: $(estado)" \
+    "PMRT dmesg del modulo:" \
+    "$(dmesg 2>/dev/null | grep 's5-pmrt-arm' | tail -20)"
+
+if [ "$rc" != 0 ]; then
+    anota "$ELOG" \
+        "###   !!! PASO 1: el insmod FALLO (rc=$rc). El apagado sera normal y SIN blindaje" \
+        "###   !!! => este apagado gastara ~18-20 W en S5. Autopsia en $LOG."
+fi
+
+limpia_legacy
+exit 0

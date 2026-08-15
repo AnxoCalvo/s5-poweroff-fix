@@ -1,0 +1,19 @@
+[Unit]
+Description=Comprueba que la mitigacion del drenaje en S5 (dGPU NVIDIA) sigue viva
+Documentation=file:///usr/local/bin/s5-mitigacion-check
+# DESPUES de akmods: si no, en el primer arranque con un kernel nuevo pillaria a
+# akmods a medio construir el modulo y daria un FALLO falso, que es justo la
+# forma de que nadie vuelva a hacer caso a este aviso.
+After=akmods.service local-fs.target var-log.mount
+Wants=akmods.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Falla a proposito si algo no cuadra: asi sale en `systemctl --failed`, que es
+# lo que ya se mira despues de cada medida. Ademas avisa por `wall` y deja
+# /var/lib/s5-test/mitigacion-ROTA.
+ExecStart=/usr/local/bin/s5-mitigacion-check --boot
+
+[Install]
+WantedBy=multi-user.target

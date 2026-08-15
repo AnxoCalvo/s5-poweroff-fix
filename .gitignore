@@ -1,0 +1,29 @@
+# fixtures del ensayo: se generan en cada pasada a partir del journal vivo, y se
+# borran solas cuando todo sale verde (si quedan, es que algo fallo). Guardarlas
+# las clavaria a las fechas de la maquina donde se escribieron, que es justo lo
+# que tests/ensayo-ramas.sh evita.
+/tests/fixtures/
+
+# artefactos de compilación del módulo (el .ko lo produce akmods, no el repo)
+*.ko
+*.ko.xz
+*.o
+*.mod
+*.mod.c
+*.symvers
+modules.order
+
+# EL TARBALL Y LOS RPM SE GENERAN, NO SE VERSIONAN. Antes el .c vivia SOLO dentro
+# de s5-pmrt-arm-1.0.tar.gz: en GitHub el corazon del proyecto no se podia leer,
+# ni buscar, ni revisar, y cada cambio salia como un diff binario. Ahora el
+# fuente esta suelto en kmod/s5-pmrt-arm-1.0/ y el tarball lo arma quien compila
+# (ver kmod/REBUILDING.md). El .src.rpm que habia versionado ademas se habia
+# quedado atras: llevaba dentro el modelo del portatil y los BDF de la maquina de
+# desarrollo que el repo ya habia limpiado, con la misma version que el spec
+# bueno. Un binario derivable que contradice a su fuente no se publica.
+/kmod/s5-pmrt-arm-*.tar.gz
+/kmod/rpmbuild/
+*.rpm
+
+# guion de una noche concreta, no parte del proyecto
+/preparar-medida.sh

@@ -1,0 +1,161 @@
+#!/bin/bash
+# s5-grub-halt — mide el consumo en S5 apagando DESDE GRUB, sin que llegue a
+# ejecutarse ningun kernel de Linux.
+#
+# Por que: a 2026-08-09 sabemos que apagar desde Fedora deja ~20 W en S5 y
+# desde Windows <=3,6 W, y que el hook de shutdown NO puede arreglarlo porque
+# pci_device_shutdown() hace pm_runtime_resume() de todo el bus PCI despues de
+# que corran los hooks de userspace. Esta prueba quita a Linux de la ecuacion:
+# GRUB ejecuta `halt`, que en EFI llama a ResetSystem(EfiResetShutdown) — el
+# apagado propio del firmware — con el hardware tal y como lo dejo el POST.
+#
+#   ~20 W  => el S5 de esta plataforma NO corta el rail de la dGPU; Windows
+#             solo se salva porque la apaga explicitamente antes de irse.
+#   ~3 W   => la plataforma si apaga bien y la culpa es de algo que deja Linux.
+#
+# Se apoya en s5-energy-log (medidor) y en la fase 3 de s5-test, que cierra la
+# prueba sola al arrancar leyendo /var/lib/s5-test/pending.
+#
+# Uso:
+#   sudo s5-grub-halt [-m MIN] [-f]      (por defecto 20 min)
+#   sudo s5-grub-halt abort
+
+set -u
+
+STATE_DIR=/var/lib/s5-test
+PENDING="$STATE_DIR/pending"
+LOG=/var/log/s5-energy.log
+# el sabor de GRUB (grub2-* en Fedora/RHEL/SUSE, grub-* en Debian/Ubuntu/Arch)
+DESCUBRE_GRUB=${S5_DESCUBRE_GRUB:-/usr/local/bin/s5-descubre-grub}
+GRUB_DIR=''; GRUB_CUSTOM=''; GRUB_REBOOT=''; GRUB_EDITENV=''
+# shellcheck source=/dev/null
+[ -r "$DESCUBRE_GRUB" ] && . "$DESCUBRE_GRUB"
+CUSTOM="$GRUB_CUSTOM"
+CLEANUP_UNIT=/etc/systemd/system/s5-grub-halt-cleanup.service
+ENTRY_ID=s5halt
+# primera BAT* encontrada; escape con S5_BAT= (ver la conf de ejemplo)
+BAT="${S5_BAT:-$(ls -d /sys/class/power_supply/BAT* 2>/dev/null | head -1)}"
+MINUTES=20
+FORCE=0
+# margen entre el reinicio y el halt de GRUB (POST + menu). El despertador se
+# arma contando desde ahora, asi que hay que sumarlo para que el S5 real dure
+# MINUTES. La ventana que mide s5-energy-log incluye este margen: a ~40 W son
+# ~0,5 Wh, se descuenta al interpretar.
+MARGEN=75
+
+die()  { echo "s5-grub-halt: $*" >&2; exit 1; }
+info() { echo "s5-grub-halt: $*"; }
+logline() { printf '%s\n' "$*" >> "$LOG"; }
+bat_wh()  { awk '{printf "%.3f", $1/1000000}' "$BAT/energy_now"; }
+bat_pct() { cat "$BAT/capacity"; }
+on_battery() {
+    for a in /sys/class/power_supply/AC* /sys/class/power_supply/ADP*; do
+        [ -r "$a/online" ] && { [ "$(cat "$a/online")" = 0 ]; return; }
+    done
+    return 1
+}
+
+[ "$(id -u)" = 0 ] || die "hay que ejecutarlo como root (sudo)"
+
+limpiar() {
+    rm -f "$CUSTOM"
+    [ -n "$GRUB_EDITENV" ] && "$GRUB_EDITENV" - unset next_entry 2>/dev/null
+    echo 0 > /sys/class/rtc/rtc0/wakealarm 2>/dev/null
+    systemctl disable s5-grub-halt-cleanup.service >/dev/null 2>&1
+    rm -f "$CLEANUP_UNIT"
+    systemctl daemon-reload >/dev/null 2>&1
+}
+
+case "${1:-}" in
+    abort)
+        limpiar; rm -f "$PENDING"
+        info "prueba cancelada y todo limpio (custom.cfg, next_entry, wakealarm)"
+        exit 0 ;;
+    cleanup)          # lo invoca la unidad oneshot en el arranque siguiente
+        rm -f "$CUSTOM"
+        systemctl disable s5-grub-halt-cleanup.service >/dev/null 2>&1
+        rm -f "$CLEANUP_UNIT"
+        exit 0 ;;
+esac
+
+while getopts "m:f" o; do
+    case "$o" in
+        m) MINUTES=$OPTARG ;;
+        f) FORCE=1 ;;
+        *) die "uso: s5-grub-halt [-m MIN] [-f] | abort" ;;
+    esac
+done
+
+[ "$MINUTES" -ge 5 ] && [ "$MINUTES" -le 180 ] || die "-m fuera de rango (5..180)"
+[ -e "$PENDING" ] && die "hay una prueba de s5-test a medias sin cerrar (s5-test status)"
+[ -d /sys/firmware/efi ] || die "esto no arranca por EFI; el 'halt' de GRUB haria otra cosa"
+[ -n "$GRUB_REBOOT" ]  || die "no encuentro grub2-reboot ni grub-reboot"
+[ -n "$GRUB_EDITENV" ] || die "no encuentro grub2-editenv ni grub-editenv"
+[ -n "$CUSTOM" ]       || die "no encuentro el directorio de GRUB (ni /boot/grub2 ni /boot/grub con grubenv)"
+
+# Presupuesto de bateria: ~20 W en S5 + margen de arranque
+need=$(awk -v m="$MINUTES" 'BEGIN{printf "%.1f", m/60*20 + 8}')
+have=$(bat_wh)
+if [ "$FORCE" != 1 ]; then
+    awk -v h="$have" -v n="$need" 'BEGIN{exit !(h < n)}' && \
+        die "bateria insuficiente: $have Wh, hacen falta ~$need Wh. Carga primero (o -f)."
+    on_battery || die "el equipo esta ENCHUFADO: desenchufalo antes (o -f)."
+fi
+
+# --- entrada de GRUB de un solo uso -----------------------------------------
+# Si 'halt' no existiese en este GRUB, la entrada falla, el menu expira a los
+# 5 s y arranca Fedora normal: fallo benigno y visible en el log (fase 3 dira
+# "NO desperto por RTC").
+cat > "$CUSTOM" <<EOF
+# Generado por s5-grub-halt — se borra solo en el arranque siguiente.
+menuentry 'S5TEST — halt desde GRUB (prueba de consumo en S5)' --id $ENTRY_ID {
+    echo "s5-grub-halt: apagando desde GRUB (ResetSystem/EfiResetShutdown)..."
+    halt
+}
+EOF
+chmod 0644 "$CUSTOM"
+
+"$GRUB_REBOOT" "$ENTRY_ID" || { rm -f "$CUSTOM"; die "$GRUB_REBOOT fallo"; }
+"$GRUB_EDITENV" - list | grep -q "^next_entry=$ENTRY_ID$" || {
+    limpiar; die "next_entry no quedo grabado en el grubenv; abortado"; }
+
+# --- unidad que borra la entrada en el arranque siguiente -------------------
+# HEREDOC SIN COMILLAS A PROPOSITO: $CUSTOM tiene que EXPANDIRSE. Con <<'EOF'
+# systemd recibiria la cadena literal "$CUSTOM" —una ruta que no existe nunca—
+# y la condicion no se cumpliria jamas: la entrada de GRUB se quedaria sin
+# barrer. Dentro no hay ninguna otra expansion, asi que no arriesga nada mas.
+cat > "$CLEANUP_UNIT" <<EOF
+[Unit]
+Description=Borra la entrada de GRUB que dejo s5-grub-halt
+ConditionPathExists=$CUSTOM
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/s5-grub-halt cleanup
+RemainAfterExit=no
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable s5-grub-halt-cleanup.service >/dev/null || { limpiar; die "no pude activar la unidad de limpieza"; }
+
+# --- despertador RTC --------------------------------------------------------
+WAKE_AT=$(( $(date +%s) + MARGEN + MINUTES*60 ))
+echo 0 > /sys/class/rtc/rtc0/wakealarm
+echo "$WAKE_AT" > /sys/class/rtc/rtc0/wakealarm || { limpiar; die "no se pudo armar el RTC"; }
+ARMED=$(cat /sys/class/rtc/rtc0/wakealarm)
+
+# --- que la fase 3 de s5-test cierre la prueba sola -------------------------
+mkdir -p "$STATE_DIR"
+{ echo "LABEL='grub-halt'"; echo "MINUTES=$MINUTES"; echo "ARGS="; echo "PRE="
+  echo "WAKE_AT=$WAKE_AT"; } > "$PENDING"
+
+logline "### PRUEBA 'grub-halt' — reiniciando $(date '+%F %T')  bat $(bat_pct)% $(bat_wh) Wh"
+logline "###   se apagara DESDE GRUB con 'halt' (ningun kernel de Linux llega a correr)"
+logline "###   la ventana medida incluye ~${MARGEN}s de POST+GRUB (~0,5 Wh) — descontarlos"
+logline "###   despertar RTC programado a los $MINUTES min de S5 (wakealarm=$ARMED)"
+
+info "todo armado. Reiniciando: GRUB ejecutara 'halt' y el RTC despertara el equipo en ~$((MINUTES + MARGEN/60)) min."
+info "NO abras ni cierres la tapa durante la prueba (esta maquina arranca al abrirla)."
+sync
+sleep 3
+systemctl reboot

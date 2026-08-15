@@ -1,0 +1,113 @@
+# /etc/s5-poweroff-fix.conf — manual override for the auto-detection.
+#
+# YOU DO NOT NEED THIS in the normal case: s5-descubre-dgpu finds the discrete
+# GPU, its audio function and its PCIe bridge by reading sysfs. Check that it
+# gets it right first:
+#
+#     s5-descubre-dgpu
+#
+# You only need this file if that does NOT give the right answer. Whatever you
+# set here wins; whatever you leave commented out is still auto-detected.
+
+# ---------------------------------------------------------------------------
+# WHICH DEVICES
+# ---------------------------------------------------------------------------
+
+# Vendor of the discrete GPU. Defaults to NVIDIA. The integrated GPU is never
+# touched: this filter is exactly what separates the two when both are present.
+#   0x10de NVIDIA   0x1002 AMD/ATI   0x8086 Intel
+#S5_VENDOR=0x10de
+
+# Exact PCI addresses (`lspci -D` lists them). Use these if you have more than
+# one discrete GPU, if it is an eGPU, or if detection picks the wrong device.
+#
+# CAREFUL: whatever you put here is what the module will shield. A wrong address
+# points at some other device — your NVMe, your network card — and that must not
+# be shielded. Verify with `lspci -D` first.
+#GPU=0000:01:00.0
+
+# HDMI audio function of the discrete GPU. By default it is derived (same
+# address, function .1) and only accepted if it really is an audio-class device.
+#AUDIO=0000:01:00.1
+
+# To leave a part alone ON PURPOSE, set it to `none`. An EMPTY value does not
+# work and never did: the detector cannot tell "the config set this to empty"
+# from "nobody set it", so it just filled it back in and the audio function was
+# shielded anyway — the opposite of what this file used to promise.
+#AUDIO=none
+
+# The PCIe bridge it hangs off. By default derived from the sysfs topology.
+# It only gets the runtime-PM disable, which is per-device and harmless; its
+# driver (pcieport) is NEVER touched, because it governs every port.
+# `BRIDGE=none` also works, same as above.
+#BRIDGE=0000:00:01.1
+
+# ---------------------------------------------------------------------------
+# THE REST — you almost certainly do not need any of this
+# ---------------------------------------------------------------------------
+
+# Battery to read for the energy witnesses. By default the first
+# /sys/class/power_supply/BAT* is used, which is right on most laptops. Set it
+# if yours is named differently or if you have two batteries and want a
+# specific one. The value is a full path, not just a name.
+# It reaches every reader, and getting there took two goes. Until 2026-08-14
+# `s5-energy-log` — the one that writes the evidence log — ignored it, so on a
+# two-battery laptop the hook and the meter read DIFFERENT cells and the Wh
+# arithmetic between shutdown and boot meant nothing. Two of the `--tools`
+# instruments were still missing it on 2026-08-15: `s5-queue` never read this
+# file at all, and `s5-state-dump` read it six lines too late to matter. Neither
+# fed the evidence arithmetic, but "every reader" has to be literally true or it
+# is not worth writing down.
+#S5_BAT=/sys/class/power_supply/BAT1
+
+# GRUB flavour. Auto-detected by s5-descubre-grub: `grub2-*` + /boot/grub2 on
+# Fedora/RHEL/SUSE, `grub-*` + /boot/grub on Debian/Ubuntu/Arch. Each of the
+# three is detected on its own — a mixed install (Fedora commands, Debian
+# directory) is not second-guessed. Check what it found with:
+#
+#     sudo s5-descubre-grub
+#
+# Set these only if that gets it wrong. Whatever you set here wins and is not
+# even looked for. If any of them ends up empty, the GRUB branch of the policy
+# disables itself and the shutdown proceeds normally — you lose the saving in
+# the rare case where the dGPU stays awake, nothing else.
+#
+# The directory must be the one holding `grubenv` (that is what makes GRUB read
+# the `custom.cfg` written next to it), NOT /boot/efi or /etc/grub.d.
+#S5_GRUB_DIR=/boot/grub
+#S5_GRUB_REBOOT=grub-reboot
+#S5_GRUB_EDITENV=grub-editenv
+
+# How long the rare-case policy waits, at shutdown, for the dGPU to fall to
+# D3cold on its own before diverting through GRUB. 90 s by default. Lower it and
+# you divert more often than you need (each divert costs you a reboot and two
+# POSTs); raise it and every shutdown where the GPU is genuinely stuck takes
+# longer before it gives up.
+#S5_POLITICA_MAXWAIT=90
+
+# Third-party shutdown hooks you have already looked at and consider fine.
+# `s5-mitigacion-check` lists every executable in /usr/lib/systemd/system-shutdown
+# that is not one of ours, because systemd runs them all during shutdown and it
+# is worth knowing what else is in there. Naming them here stops it mentioning
+# them. It does NOT silence the real check: a stray copy of one of OUR hooks
+# (a `.bak-`, an `.orig`) is still a FAILURE, because systemd would run it in
+# parallel with the good one. Space-separated basenames.
+#S5_HOOKS_EXTRA="fwupd.shutdown mdadm.shutdown"
+
+# Where the bootloader entries live, for the `--tools` measurement harness.
+# Defaults to /boot/loader/entries, the BLS layout used by Fedora, RHEL and SUSE.
+#
+# Only two things read it, and neither is part of the fix: `s5-test -a`, which
+# patches kernel arguments into every entry (keeping a backup) so a measurement
+# can boot with them, and `uninstall.sh`, which restores that backup if you
+# uninstall while a test is still armed — without which your entries would stay
+# patched forever. If your distro puts them elsewhere, or you are not on BLS at
+# all, `s5-test -a` fails loudly rather than patching the wrong directory.
+#S5_BLS_DIR=/boot/loader/entries
+
+# Optional fallback `.ko` for insmod, in case the akmod's modprobe fails.
+# EMPTY BY DEFAULT, and that is deliberate: the akmod is the only mechanism that
+# survives a kernel update, and a hand-built .ko stops working the moment the
+# kernel changes. If you still want a net underneath, point this at it — and
+# remember to rebuild it after every kernel update, or it becomes dead weight.
+#S5_KO_RESPALDO=/usr/local/src/s5-pmrt-arm/s5_pmrt_arm.ko

@@ -1,0 +1,691 @@
+#!/bin/bash
+# /usr/local/bin/s5-mitigacion-check
+#
+# VERIFICADOR DE LA MITIGACION DEL DRENAJE EN S5 (dGPU NVIDIA, ~18-20 W).
+#
+# El problema que resuelve: la mitigacion es silenciosa por los dos lados. Si el
+# modulo no carga (kernel nuevo, akmods que fallo, lockdown), el apagado sale
+# igual de bien a la vista y gasta 18-20 W; y el testigo que lo delata queda
+# enterrado en /var/log/s5-shutdown-pci.log, que no lee nadie. Esto lo saca a la
+# cara: mira hacia ADELANTE (¿estare protegido en el proximo apagado?) y hacia
+# ATRAS (¿funciono el anterior, y cuanto costo?).
+#
+#   s5-mitigacion-check          informe legible; rc=1 si hay algun FALLO
+#   s5-mitigacion-check --boot   modo unidad: ademas avisa por `wall` y deja
+#                                /var/lib/s5-test/mitigacion-ROTA
+#   s5-mitigacion-check -q       solo el veredicto
+#
+# Se ejecuta solo en cada arranque por s5-mitigacion-check.service, ordenado
+# DESPUES de akmods.service (si no, pillaria a akmods a medio construir el
+# modulo del kernel nuevo y daria un falso FALLO).
+
+set -u
+
+HOOKDIR=${HOOKDIR:-/usr/lib/systemd/system-shutdown}   # overridable SOLO para ensayar (regla 22)
+HOOK=$HOOKDIR/99y-s5-gpu-pmrt.shutdown
+DISABLE=/var/lib/s5-test/gpu-pmrt-disabled
+CONTROL_D0=/var/lib/s5-test/gpu-d0-control   # guarda de `s5-gpu-en-uso-arm`
+PM1AFLAG=/var/lib/s5-test/gpu-pm1a-armed
+PM1AHOOK=/usr/lib/systemd/system-shutdown/99z-s5-gpu-pm1a.shutdown
+MODNAME=s5_pmrt_arm
+# Respaldo OPCIONAL de `insmod`, el mismo que el hook 99y saca de la
+# configuracion. Vacio por defecto: la ruta que habia clavada aqui era la de la
+# maquina donde se diagnostico esto y en cualquier otra no existe.
+S5_CONF=${S5_CONF:-/etc/s5-poweroff-fix.conf}
+# shellcheck source=/dev/null
+[ -r "$S5_CONF" ] && . "$S5_CONF"
+BACKUP_KO="${S5_KO_RESPALDO:-}"
+# QUE dispositivos deberia blindar el modulo en ESTA maquina. Hace falta en la
+# seccion 9: el recuento correcto no es una constante, es cuantos BDF tiene esta
+# topologia. Solo lee atributos de sysfs cacheados (class, vendor, el symlink del
+# padre), nunca el espacio de configuracion, asi que no despierta nada (regla 20).
+DESCUBRE=${S5_DESCUBRE:-/usr/local/bin/s5-descubre-dgpu}
+GPU=''; AUDIO=''; BRIDGE=''; S5_DEVS=''
+# shellcheck source=/dev/null
+[ -r "$DESCUBRE" ] && . "$DESCUBRE"
+# El sabor de GRUB (grub2-* en Fedora/RHEL/SUSE, grub-* en Debian/Ubuntu/Arch).
+# Aqui SI se puede descubrir el directorio en una sola pasada: esto corre en el
+# ARRANQUE, con /boot ya montado — al reves que la politica, que corre en mitad
+# del apagado y tiene que montarlo ella (regla 28).
+DESCUBRE_GRUB=${S5_DESCUBRE_GRUB:-/usr/local/bin/s5-descubre-grub}
+GRUB_DIR=''; GRUB_CUSTOM=''; GRUB_REBOOT=''; GRUB_EDITENV=''; GRUB_SIN_PERMISO=''
+# shellcheck source=/dev/null
+[ -r "$DESCUBRE_GRUB" ] && . "$DESCUBRE_GRUB"
+PCILOG=${PCILOG:-/var/log/s5-shutdown-pci.log}   # overridable SOLO para ensayar las ramas del propio verificador (regla 22)
+ELOG=${ELOG:-/var/log/s5-energy.log}             # overridable SOLO para ensayar las ramas del propio verificador (regla 22)
+MARKER=/var/lib/s5-test/mitigacion-ROTA
+KVER="$(uname -r)"
+UMBRAL_W=4          # por encima de esto, el apagado anterior NO estuvo mitigado
+# LOS HOOKS QUE INSTALA ESTE PROYECTO. La regla 17 nacio de un `*.bak-*` de uno
+# de ESTOS que se quedo en el directorio y sistemd lo ejecuto EN PARALELO con el
+# bueno, hundiendo un control. O sea que el peligro real es una copia suelta de
+# los nuestros, no que la distro traiga sus propios hooks.
+#
+# Aqui habia una lista blanca de CUATRO que incluia `fwupd.shutdown` y
+# `mdadm.shutdown`: los que habia instalados en la maquina donde se desarrollo
+# esto. Cualquier otro ejecutable daba FALLO —no aviso— o sea rc=1, el fichero
+# mitigacion-ROTA y un `wall` a todas las terminales EN CADA ARRANQUE. Una
+# maquina ajena, perfectamente instalada y funcionando, gritaba que la mitigacion
+# estaba rota porque su distro trae otro paquete. Es exactamente el aviso que no
+# significa nada contra el que existe la regla 27.
+HOOKS_PROPIOS="99-s5-pci-state.shutdown 99y-s5-gpu-pmrt.shutdown"
+# Hooks de terceros que el administrador ya ha visto y da por buenos, para dejar
+# de oir el aviso. Se documenta en s5-poweroff-fix.conf.example.
+S5_HOOKS_EXTRA=${S5_HOOKS_EXTRA:-}
+
+MODO=informe
+case "${1:-}" in
+    --boot) MODO=boot ;;
+    -q)     MODO=quiet ;;
+esac
+
+fallos=0; avisos=0; motivos=()
+
+di() { [ "$MODO" = quiet ] || printf '%s\n' "$*"; }
+ok()    { di "  [ OK ]   $*"; }
+aviso() { di "  [AVISO]  $*"; avisos=$((avisos+1)); }
+fallo() { di "  [FALLO]  $*"; fallos=$((fallos+1)); motivos+=("$*"); }
+# El veredicto se imprime SIEMPRE, tambien con -q: si fuera por di(), `-q` no
+# sacaria nada, y esta documentado como "solo el veredicto". Ojo al nombre: mas
+# abajo hay una VARIABLE $ver (version del akmod). Bash las distingue, pero
+# leerlo cuesta, asi que la funcion se llama veredicto().
+veredicto() { printf '%s\n' "$*"; }
+# `%F %T` -> epoch, para correlacionar dos logs que no comparten formato ni
+# fichero (el bloque de la politica en $PCILOG y el resumen de $ELOG). Devuelve
+# vacio si la fecha no se puede leer, y quien llama tiene que tratarlo.
+ep() { date -d "$1" +%s 2>/dev/null; }
+# Segundos -> algo que se pueda leer. Las duraciones de aqui van de los ~20 s de
+# una pasada de POST a la noche entera, y "34267.2s" no lo lee nadie.
+dur() { awk -v s="$1" 'BEGIN{ if (s+0 >= 3600) printf "%.2f h", s/3600
+                              else if (s+0 >= 60) printf "%.1f min", s/60
+                              else printf "%.0f s", s }'; }
+
+di "s5-mitigacion-check — kernel $KVER — $(date '+%F %T')"
+di
+di "A. EL PROXIMO APAGADO (¿voy a estar protegido?)"
+
+# --- 1. el hook ------------------------------------------------------------
+if [ -x "$HOOK" ]; then ok "hook $(basename $HOOK) presente y ejecutable"
+else fallo "NO esta el hook $HOOK => el proximo apagado gastara 18-20 W"; fi
+
+# --- 2. regla 17: nada de mas en el directorio de hooks ---------------------
+# Se separan dos cosas que antes se trataban igual:
+#   intrusos -> algo con "s5" en el nombre que NO es uno de los nuestros. Eso es
+#               una copia suelta (`*.bak-*`, `.orig`, un renombrado a medias) que
+#               systemd va a EJECUTAR EN PARALELO con el bueno. Es el accidente
+#               de la regla 17 y sigue siendo FALLO.
+#   ajenos   -> hooks de otros paquetes. systemd tambien los corre, asi que se
+#               NOMBRAN —saber que mas corre en el apagado vale para diagnosticar—
+#               pero ni son cosa nuestra ni cuentan como aviso: seria cambiar un
+#               ruido por otro, y el que de verdad detecta una interferencia es
+#               el vataje de la seccion 10 (regla 3: solo la energia discrimina).
+#               Se callan del todo con S5_HOOKS_EXTRA.
+intrusos=""; ajenos=""; propios=0
+while IFS= read -r f; do
+    b="$(basename "$f")"
+    case " $HOOKS_PROPIOS " in *" $b "*) propios=$((propios+1)); continue ;; esac
+    case " $S5_HOOKS_EXTRA " in *" $b "*) continue ;; esac
+    case "$b" in *s5*|*S5*) intrusos="$intrusos $b" ;; *) ajenos="$ajenos $b" ;; esac
+done < <(find "$HOOKDIR" -type f -perm -u+x 2>/dev/null)
+if [ -n "$intrusos" ]; then
+    fallo "COPIAS SUELTAS de nuestros hooks en $HOOKDIR:$intrusos — systemd las corre EN PARALELO con el bueno (regla 17). Borralas"
+else
+    ok "directorio de hooks limpio (regla 17): los $propios nuestros, sin copias sueltas"
+    [ -n "$ajenos" ] && \
+        di "  [ -- ]     y hooks de otros paquetes, que systemd corre tambien:$ajenos (para no volver a verlos: S5_HOOKS_EXTRA='${ajenos# }' en $S5_CONF)"
+fi
+
+# --- 3. freno de mano ------------------------------------------------------
+if [ -e "$DISABLE" ]; then
+    fallo "FRENO DE MANO PUESTO ($DISABLE, $(stat -c %y "$DISABLE" 2>/dev/null | cut -d. -f1)) => apagados SIN mitigar, ~18-20 W. Borrarlo con: sudo rm $DISABLE"
+else ok "sin freno de mano"; fi
+
+# --- 3bis. la guarda del control D0 -----------------------------------------
+# `s5-gpu-en-uso-arm` deja este flag para decirle al hook 99 que NO duerma la
+# dGPU: es asi como se fabrica el caso caro a proposito. Es de UN SOLO USO —el
+# propio hook 99 lo borra en su primera ventana de escritura, antes de la
+# espera— asi que envenena el proximo apagado y no los siguientes. Aun asi hay
+# que mirarlo, por dos motivos:
+#   1. ese apagado cuesta ~19 W y hoy no lo avisa nadie: se arma, se olvida, y
+#      la factura llega sin remite. Es justo el fallo mudo para el que existe
+#      esta seccion A ("¿voy a estar protegido en el PROXIMO apagado?").
+#   2. su borrado va dentro de un `mount -o remount,rw /`, y en la ruta de
+#      apagado eso puede fallar EN SILENCIO y de forma INTERMITENTE (regla 18),
+#      asi que "es de un solo uso" no se puede dar por hecho.
+if [ -e "$CONTROL_D0" ]; then
+    fallo "GUARDA DEL CONTROL D0 PUESTA ($CONTROL_D0, $(stat -c %y "$CONTROL_D0" 2>/dev/null | cut -d. -f1)): el hook 99 NO dormira la dGPU y el PROXIMO apagado costara ~19 W. Si no estas midiendo 'gpu-en-uso' a proposito, borrala con: sudo rm $CONTROL_D0"
+else ok "sin la guarda del control D0 (el hook 99 dormira la dGPU)"; fi
+
+# --- 4. el arnes de PM1a, retirado -----------------------------------------
+if [ -e "$PM1AFLAG" ] && [ -x "$PM1AHOOK" ]; then
+    fallo "el arnes de PM1a esta reinstalado Y armado: el hook 99y ABORTA y apagaria por PM1a_CNT"
+elif [ -x "$PM1AHOOK" ]; then aviso "el hook 99z de PM1a esta reinstalado (sin armar). Correrian los dos en paralelo si se arma"
+else ok "arnes de PM1a retirado"; fi
+
+# --- 5. EL MODULO PARA EL KERNEL VIVO (el hueco que abre un dnf update) -----
+ko="$(modinfo -k "$KVER" -n "$MODNAME" 2>/dev/null)"
+vm="$(modinfo -k "$KVER" -F vermagic "$MODNAME" 2>/dev/null | awk '{print $1}')"
+bvm=""
+[ -n "$BACKUP_KO" ] && [ -r "$BACKUP_KO" ] && bvm="$(modinfo -F vermagic "$BACKUP_KO" 2>/dev/null | awk '{print $1}')"
+
+# El hook carga con `modprobe` (akmod) y, si falla y hay respaldo configurado,
+# con `insmod` sobre ese .ko. Asi que solo es FALLO si NINGUNA via sirve para el
+# kernel vivo; si el akmod falta pero el respaldo casa, estas protegido por la
+# via fragil — eso es un aviso, no un fallo. Gritar de mas es la forma mas
+# rapida de que nadie vuelva a leer este informe.
+if [ -n "$ko" ] && [ "$vm" = "$KVER" ]; then
+    ok "modulo cargable para $KVER (akmod): $ko"
+    if [ -z "$BACKUP_KO" ]; then :   # sin respaldo configurado: es lo normal, no se dice nada
+    elif [ "$bvm" = "$KVER" ]; then ok "respaldo .ko a mano tambien valido ($bvm)"
+    else di "  [ -- ]   respaldo .ko a mano es de ${bvm:-ninguno} (da igual: el akmod esta)"; fi
+elif [ "$bvm" = "$KVER" ]; then
+    aviso "el akmod NO tiene modulo para $KVER (${ko:+vermagic=$vm}${ko:-no instalado}); tira del RESPALDO a mano, que se rompera al proximo kernel. Arreglo: sudo akmods --kernels $KVER"
+else
+    fallo "NO hay modulo $MODNAME cargable para el kernel vivo $KVER (akmod: ${ko:+vermagic=$vm}${ko:-ausente}; respaldo: ${bvm:-ausente}) => la mitigacion NO puede actuar y el proximo apagado gastara 18-20 W. Arreglo: sudo akmods --kernels $KVER"
+fi
+
+# --- 6. akmods -------------------------------------------------------------
+if rpm -q akmod-s5-pmrt-arm >/dev/null 2>&1; then
+    ver="$(rpm -q --qf '%{VERSION}-%{RELEASE}' akmod-s5-pmrt-arm 2>/dev/null | sed 's/\.fc[0-9]*$//')"
+    flog="/var/cache/akmods/s5-pmrt-arm/${ver}-for-${KVER}.failed.log"
+    if [ -e "$flog" ]; then
+        fallo "akmods FALLO al construir $ver para $KVER. Autopsia: $flog"
+    else
+        ok "akmod-s5-pmrt-arm $ver instalado, sin fallos de construccion para este kernel"
+    fi
+else
+    aviso "akmod-s5-pmrt-arm NO instalado: el modulo no se reconstruira solo al actualizar el kernel"
+fi
+
+# --- 7. lockdown / firma de modulos ----------------------------------------
+ld="$(cat /sys/kernel/security/lockdown 2>/dev/null || echo '?')"
+case "$ld" in
+    *'[none]'*) ok "lockdown=[none]: se pueden cargar modulos" ;;
+    '?')        aviso "no se puede leer /sys/kernel/security/lockdown" ;;
+    *)          fallo "LOCKDOWN ACTIVO ($ld): la carga del modulo fallara y la mitigacion muere" ;;
+esac
+
+# --- 8. la politica del caso raro: dGPU despierta al apagar -----------------
+# (numerada 8 y no 9: la 9 es el bloque del hook, ya en la seccion B. Antes las
+# dos eran "9" y la 6 no existia.)
+# No protege el caso normal (de eso se encarga el hook 99y), sino el medido en
+# 'gpu-en-uso-v1': si la dGPU llega despierta el S5 cuesta 19 W y el hook no
+# puede hacer nada. Por eso sus problemas son AVISO y no FALLO: sin ella sigues
+# teniendo tus ~2 W en un apagado normal.
+pol_ok=1; grub_no_juzgado=0
+[ -x /usr/local/bin/s5-gpu-politica ]          || { aviso "falta /usr/local/bin/s5-gpu-politica (la politica del caso raro no actuara)"; pol_ok=0; }
+[ -x /usr/local/bin/s5-gpu-politica-cleanup ]  || { aviso "falta s5-gpu-politica-cleanup: un custom.cfg podria quedarse sin barrer"; pol_ok=0; }
+# Sin el descubridor —o con un GRUB que no encaja en ninguno de los dos sabores—
+# la politica aborta su rama de GRUB en mitad del apagado, donde nadie lo lee.
+# Que se sepa AQUI, en frio, y no la noche que hacia falta.
+[ -r "$DESCUBRE_GRUB" ] || { aviso "falta $DESCUBRE_GRUB: la politica no sabra que GRUB tiene esta maquina y abortara su rama de GRUB"; pol_ok=0; }
+if [ -r "$DESCUBRE_GRUB" ] && { [ -z "$GRUB_CUSTOM" ] || [ -z "$GRUB_REBOOT" ] || [ -z "$GRUB_EDITENV" ]; }; then
+    # SIN sudo ESTO NO ES UN PROBLEMA DE GRUB, ES DE PERMISOS. /boot/grub2 suele
+    # ser drwx------ root, asi que un `s5-mitigacion-check` de usuario no lo ve y
+    # esto gritaba "GRUB incompleto" en una maquina donde la rama de GRUB esta
+    # perfecta — el aviso que no significa nada de la regla 27, y encima
+    # contradiciendo al propio s5-descubre-grub, que SI lo explica cuando se
+    # ejecuta a pelo. install.sh ya se guardaba de esto; aqui no.
+    if [ -z "$GRUB_DIR" ] && [ -n "$GRUB_SIN_PERMISO" ]; then
+        di "  [ -- ]   $GRUB_SIN_PERMISO existe pero no se puede leer sin root (suele ser drwx------): no se juzga la rama de GRUB. Relanza con sudo"
+        grub_no_juzgado=1
+    else
+        aviso "GRUB incompleto (dir=${GRUB_DIR:-no} reboot=${GRUB_REBOOT:-no} editenv=${GRUB_EDITENV:-no}): la rama de GRUB se autodesactiva; el apagado normal sigue mitigado"
+        pol_ok=0
+    fi
+fi
+[ -L /etc/systemd/system/poweroff.target.wants/s5-gpu-politica.service ] || {
+    aviso "s5-gpu-politica.service NO cuelga de poweroff.target: la politica no correra"; pol_ok=0; }
+systemctl is-enabled s5-gpu-politica-cleanup.service >/dev/null 2>&1 || {
+    aviso "s5-gpu-politica-cleanup.service no esta enabled"; pol_ok=0; }
+[ -e /var/lib/s5-test/gpu-politica-disabled ] && {
+    aviso "FRENO de la politica puesto (/var/lib/s5-test/gpu-politica-disabled)"; pol_ok=0; }
+# El texto dice EXACTAMENTE lo que se ha comprobado. Sin root no se ha podido
+# mirar el GRUB, y rematar igualmente con "y si no cae, apaga por GRUB" seria
+# afirmar la parte que no se ha medido, tres lineas debajo de haber dicho que no
+# se juzga (regla 27).
+if [ "$pol_ok" = 1 ] && [ "$grub_no_juzgado" = 1 ]; then
+    ok "politica del caso raro activa (espera 90 s; su rama de GRUB no se ha podido juzgar sin root)"
+elif [ "$pol_ok" = 1 ]; then
+    ok "politica del caso raro activa (espera 90 s y, si no cae, apaga por GRUB)"
+fi
+
+# Residuo: si la politica actuo y algo impidio el barrido, quedaria un
+# custom.cfg nuestro. No es peligroso (next_entry es de un solo uso y GRUB lo
+# consume con save_env), pero delata que el cleanup no corrio.
+if [ -n "$GRUB_CUSTOM" ] && [ -e "$GRUB_CUSTOM" ] && grep -q '# s5-gpu-politica' "$GRUB_CUSTOM" 2>/dev/null; then
+    aviso "quedo $GRUB_CUSTOM de la politica sin barrer (¿fallo s5-gpu-politica-cleanup?)"
+fi
+if [ -n "$GRUB_EDITENV" ] && "$GRUB_EDITENV" - list 2>/dev/null | grep -q '^next_entry=s5politica$'; then
+    aviso "next_entry=s5politica sin consumir: el proximo arranque apagaria desde GRUB"
+fi
+
+di
+di "B. EL APAGADO ANTERIOR (¿funciono, y cuanto costo?)"
+
+# --- 9. el ultimo bloque del hook ------------------------------------------
+blk="$(awk '
+    /^===== .*PASO 1 \(pmrt/ { n = NR }
+    { l[NR] = $0 }
+    END { for (i = n; i <= NR; i++) { if (i > n && l[i] ~ /^===== /) break; print l[i] } }
+' "$PCILOG" 2>/dev/null)"
+
+if [ -z "$blk" ]; then
+    aviso "no hay ningun bloque 'PASO 1 (pmrt' en $PCILOG (¿nunca se ha apagado con el hook puesto?)"
+else
+    fecha="$(printf '%s' "$blk" | head -1 | awk '{print $2, $3}')"
+    di "  (bloque del $fecha)"
+    chk() {   # chk <patron> <texto> [aviso|fallo]
+        if printf '%s' "$blk" | grep -qE "$1"; then ok "$2"
+        else "${3:-fallo}" "falta en el log: $2"; fi
+    }
+    chk 'PMRT MODO=permanente'                       'MODO=permanente (el testigo que valida el modo sin armar)'
+    chk 'PMRT insmod rc=0'                           'el modulo cargo (insmod rc=0)'
+
+    # CUANTOS DISPOSITIVOS SE BLINDARON. Aqui habia clavado
+    # `FIN disable=3 shutdown_anulados=2`, que son los numeros de la maquina
+    # donde se midio esto: tres dispositivos (puente + GPU + audio) y dos drivers
+    # con `.shutdown` en la lista blanca. Una discreta SIN funcion de audio HDMI,
+    # un `AUDIO=none`/`BRIDGE=none` en la configuracion, o nouveau en vez de
+    # nvidia, hacen que el modulo escriba legitimamente `disable=2
+    # shutdown_anulados=1` — y esto daba FALLO, fichero mitigacion-ROTA y `wall`
+    # en CADA arranque de una maquina perfectamente sana. Es el mismo accidente
+    # que los BDF clavados en los hooks y que la lista blanca de hooks de la
+    # regla 17, por tercera vez, y en el sitio donde mas cara sale: el informe
+    # que la gente usa para decidir si confiar en todo lo demas.
+    #
+    # El numero correcto no es una constante: es CUANTOS BDF se le pasaron al
+    # modulo en ESE apagado. Lo dice el propio bloque — el hook vuelca el dmesg
+    # del modulo y su primera linea trae el `devs=` de verdad. Si el dmesg salio
+    # recortado, se cae al descubridor vivo (misma topologia, esta maquina no ha
+    # cambiado de sitio la GPU entre el apagado y este arranque). Y si no hay
+    # ninguna de las dos fuentes se AVISA, que es lo que toca cuando no se sabe:
+    # inventarse un numero es como se llego al FALLO falso de arriba.
+    esperados=''; origen=''
+    devsblk="$(printf '%s' "$blk" | grep -oE 's5-pmrt-arm: ===== .*devs=[^ ]*' | tail -1 | sed -E 's/.*devs=//')"
+    if [ -n "$devsblk" ]; then origen='del bloque'
+    else devsblk="$S5_DEVS"; origen='del descubridor vivo'; fi
+    [ -n "$devsblk" ] && esperados="$(printf '%s' "$devsblk" | awk -F, '{n=0; for (i=1; i<=NF; i++) if ($i != "") n++; print n}')"
+
+    if [ -z "$esperados" ] || [ "$esperados" = 0 ]; then
+        aviso "no se puede saber cuantos dispositivos habia que blindar (ni devs= en el bloque ni descubridor): no se juzga el recuento del blindaje"
+    else
+        # `${esperados}` con llaves: sin ellas, `$esperados[^0-9]` se lee como si
+        # fuera una expansion de array (shellcheck SC1087). Funciona igual, pero
+        # una linea que hay que mirar dos veces para ver que no es un error no
+        # tiene sitio en el fichero que decide si la mitigacion esta viva.
+        chk "FIN +disable=${esperados}[^0-9]" "blindaje aplicado a los $esperados dispositivos de esta topologia ($origen)"
+    fi
+
+    # LA MITAD (b) DEL BLINDAJE. Tampoco lleva numero fijo: depende de que drivers
+    # esten enlazados. Lo que importa es que actuara, porque la mitad (a) SOLA
+    # colgo la maquina dos veces (`pmrt-solo-a`, docs/EVIDENCE.md).
+    anulados="$(printf '%s' "$blk" | grep -oE 'FIN +disable=[0-9]+ +shutdown_anulados=[0-9]+' | tail -1 | sed -E 's/.*shutdown_anulados=//')"
+    if [ -z "$anulados" ]; then
+        :   # sin linea FIN; el chk de arriba ya ha hablado
+    elif [ "$anulados" -ge 1 ]; then
+        ok "$anulados driver(s) con .shutdown anulado: la mitad (b) del blindaje actuo"
+    else
+        aviso "shutdown_anulados=0: ningun driver de la lista blanca estaba enlazado. Si tu dGPU tiene driver, esto hay que mirarlo — la mitad (a) sola colgo la maquina dos veces (docs/EVIDENCE.md)"
+    fi
+
+    # PCIEPORT, LA LINEA ROJA. Antes se exigia la linea `SE RESPETA`, que solo
+    # aparece si el puente tiene driver con `.shutdown`: con `BRIDGE=none`, o sin
+    # driver enlazado, faltaba y salia FALLO por no hacer nada malo. Lo que de
+    # verdad no puede pasar es lo contrario, y eso si se puede afirmar.
+    if printf '%s' "$blk" | grep -q "shutdown de 'pcieport' ANULADO"; then
+        fallo "se ANULO el .shutdown de 'pcieport', que gobierna TODOS los puertos de la maquina: la lista blanca esta mal"
+    elif printf '%s' "$blk" | grep -q "shutdown de 'pcieport' SE RESPETA"; then
+        ok "pcieport respetado (lista blanca correcta)"
+    else
+        di "  [ -- ]   el bloque no menciona a pcieport (puente sin driver, o BRIDGE=none): no habia nada que respetar"
+    fi
+    # OJO: `VEREDICTO_DESPUES` lo escribe el hook 99, que corre ANTES, asi que
+    # cae fuera de este bloque. El testigo de dentro es mejor: `unsupported`
+    # significa disable_depth>0, o sea que el blindaje esta puesto de verdad.
+    chk 'PMRT TESTIGO justo antes de blindar: dGPU=D3cold' 'la dGPU llego a D3cold antes de blindar'
+    chk 'PMRT estado tras blindar: dGPU=D3cold/unsupported' 'tras blindar: D3cold/unsupported (testigo duro de disable_depth>0)'
+    if printf '%s' "$blk" | grep -q 'via=RESPALDO-insmod'; then
+        aviso "cargo por el RESPALDO, no por el akmod: el akmod fallo en ese apagado"
+    fi
+    if printf '%s' "$blk" | grep -q 'PMRT FRENO'; then
+        fallo "ese apagado fue CON FRENO: no se blindo nada"
+    fi
+    if printf '%s' "$blk" | grep -q 'AVISO: la dGPU NO llego a D3cold'; then
+        fallo "la dGPU NO llego a D3cold: se congelo DESPIERTA y ese apagado costo ~18-20 W"
+    fi
+    if printf '%s' "$blk" | grep -qE '^P3 '; then
+        fallo "hay lineas P3: el arnes de PM1a se colo y apago por PM1a_CNT"
+    fi
+fi
+
+# --- 9bis. la politica del caso raro, en el ultimo apagado ------------------
+# Existe porque sus DOS primeros disparos reales fallaron EN SILENCIO, por
+# motivos que ninguna comprobacion de la seccion A puede ver:
+#
+#   2026-08-11 00:57:45 — sin orden contra systemd-poweroff.service: systemd la
+#     mataba a mitad de la espera (el log tiene el "esperando hasta 90s" y ni
+#     una linea mas).
+#   2026-08-11 01:53:56 — ya con la ventana buena. Esa mitad quedo CONFIRMADA
+#     (corrio tras shutdown.target y systemd la espero 14,8 s), pero el testigo
+#     canto `boot=DESMONTADO` y ahi se vio que /boot NO puede estar montado en
+#     esta fase: las unidades de montaje mueren ANTES de que se alcance
+#     shutdown.target (medido en el journal), y ordenarse contra boot.mount no
+#     arregla nada — systemd.unit(5): con un job de stop y otro de start, el
+#     stop va primero, sea After= o Before=.
+#
+# Desde el arreglo del 2026-08-11 la rama de GRUB MONTA /boot ella misma. Por
+# eso aqui `boot=DESMONTADO` es lo NORMAL y ya no es un FALLO: gritar por eso
+# seria un falso positivo en cada apagado, y gritar de mas es la forma mas
+# rapida de que nadie vuelva a leerse el informe (regla 27). Lo que se audita
+# ahora es (i) que / siguiera en rw, (ii) que llegara a decidir y (iii) que si
+# tomo la rama de GRUB consiguiera el montaje por su cuenta.
+#
+# POL_GRUB_TS queda con la fecha de la politica SOLO si de verdad enruto por
+# GRUB (armo el next_entry y reinicio). Lo usan las secciones 9ter y 10, que sin
+# el no pueden distinguir un apagado normal de uno desviado.
+POL_GRUB_TS=''
+saca_bloque() {   # saca_bloque <patron de cabecera> — imprime el ULTIMO que case
+    awk -v pat="$1" '
+        $0 ~ /^===== / && $0 ~ /POLITICA GPU/ && $0 ~ pat { n = NR }
+        { l[NR] = $0 }
+        END { if (!n) exit; for (i = n; i <= NR; i++) { if (i > n && l[i] ~ /^===== /) break; print l[i] } }
+    ' "$PCILOG" 2>/dev/null
+}
+
+# DOS bloques, y la diferencia importa:
+#   polblk  = el ultimo, sea lo que sea. Es lo que se INFORMA en la seccion 9bis
+#             ("lo ultimo que hizo la politica"), y puede ser un ensayo en seco.
+#   polreal = el ultimo con dryrun=0, o sea el ultimo APAGADO DE VERDAD. Es lo
+#             que se CORRELACIONA en 9ter y en la seccion 10.
+#
+# POR QUE SEPARADOS (encontrado a golpes el 2026-08-11): un `S5_POLITICA_DRYRUN=1`
+# escribe su bloque en este mismo log, asi que basta con ensayar la politica una
+# vez para que el ultimo bloque deje de ser el del apagado real. Con un solo
+# `polblk`, POL_GRUB_TS se quedaba vacio, la seccion 10 volvia a aplicar el
+# umbral a una ventana que no mide un S5, y el falso FALLO reaparecia — con el
+# agravante de que el motivo (haber ensayado algo hace un rato) no sale por
+# ningun lado. La correlacion por fecha de mas abajo sigue siendo la que impide
+# que un bloque real pero VIEJO tape una medida mala.
+polblk="$(saca_bloque '.')"
+polreal="$(saca_bloque 'dryrun=0')"
+if printf '%s' "$polreal" | grep -q 'POLITICA armada'; then
+    POL_GRUB_TS="$(printf '%s' "$polreal" | head -1 | awk '{print $2, $3}')"
+fi
+
+if [ -z "$polblk" ]; then
+    di "  [ -- ]   la politica no ha corrido nunca (solo actua en poweroff, no en reboot)"
+else
+    polcab="$(printf '%s' "$polblk" | head -1)"
+    polfecha="$(printf '%s' "$polcab" | awk '{print $2, $3}')"
+    if printf '%s' "$polcab" | grep -q 'dryrun=1'; then
+        di "  [ -- ]   ultimo paso de la politica ($polfecha): ENSAYO (dryrun=1), no un apagado real"
+    else
+        # (i) / tiene que seguir montado en rw. Es lo que sostiene el
+        #     `systemctl --force reboot` de la rama de GRUB y la escritura del
+        #     propio log (regla 18). De /boot ya no se dice nada aqui: en esta
+        #     fase esta desmontado por diseno de systemd, y es la rama de GRUB
+        #     la que se encarga — se audita en (iii).
+        case "$(printf '%s' "$polcab" | grep -o 'root=[A-Za-z-]*')" in
+            root=rw) ok "politica ($polfecha): / seguia montado en rw en la ventana" ;;
+            root=)   fallo "politica ($polfecha): testigo de montajes VACIO (script anterior al 2026-08-11): no mide nada" ;;
+            root=*)  aviso "politica ($polfecha): / no estaba en rw ($(printf '%s' "$polcab" | grep -o 'root=[A-Za-z-]*')); el reboot de la rama de GRUB podria no dar la vuelta" ;;
+            *)       aviso "politica ($polfecha): no hay testigo de montajes en la cabecera" ;;
+        esac
+        # (ii) que llegara a DECIDIR. Si empieza y no termina, la mataron.
+        #      Este es el testigo de que systemd nos espera: quedo confirmado
+        #      en el apagado real del 2026-08-11 01:53:56.
+        if printf '%s' "$polblk" | grep -qE 'POLITICA (sin riesgo|la dGPU cayo sola|!!! la dGPU NO cayo|ABORTADA|armada|DRYRUN)'; then
+            ok "politica ($polfecha): llego a decidir (no la cortaron a media espera)"
+        else
+            fallo "politica ($polfecha): EMPEZO Y NO TERMINO — systemd la corto antes de decidir. Revisa el orden de s5-gpu-politica.service (tiene que ir Before=umount.target systemd-poweroff.service)"
+        fi
+        # (iii) la rama de GRUB: solo se puede auditar cuando se ha tomado, o
+        #       sea cuando la dGPU llego despierta y no se durmio a tiempo.
+        if printf '%s' "$polblk" | grep -q 'enrutando por GRUB'; then
+            if printf '%s' "$polblk" | grep -qE 'POLITICA /boot: .*(montado por nosotros en rw|ya estaba montado en rw|remontado en rw)'; then
+                ok "politica ($polfecha): la rama de GRUB consiguio /boot en rw por su cuenta"
+            else
+                polabort="$(printf '%s' "$polblk" | grep -m1 'ABORTADA')"
+                fallo "politica ($polfecha): la rama de GRUB NO consiguio /boot en rw => no pudo enrutar. ${polabort:-sin linea de aborto en el log}"
+            fi
+            if printf '%s' "$polblk" | grep -q 'POLITICA armada'; then
+                # "lanzo el reinicio", no "apago": que GRUB llegara a ejecutar
+                # el `halt` no lo puede decir este log — lo comprueba 9ter.
+                # (POL_GRUB_TS no se pone aqui: sale de $polreal, arriba.)
+                ok "politica ($polfecha): armo GRUB (next_entry) y lanzo el reinicio"
+            fi
+        elif printf '%s' "$polblk" | grep -qE 'POLITICA (sin riesgo|la dGPU cayo sola)'; then
+            di "  [ -- ]   politica ($polfecha): no hizo falta la rama de GRUB (la dGPU se durmio sola)"
+        fi
+        # Si no decidio, no se dice nada aqui: el FALLO de (ii) ya lo explica y
+        # afirmar "se durmio sola" seria inventarse un desenlace que nadie vio.
+    fi
+fi
+
+# --- 9ter. ¿GRUB APAGO DE VERDAD? --------------------------------------------
+# El unico cabo que ningun log de este proyecto puede cerrar por si solo: cuando
+# la politica enruta por GRUB no queda ningun kernel vivo para contarlo. GRUB
+# ejecuta `halt` y ahi se acaba todo rastro. Si el `halt` fallara (modulo
+# ausente, entrada mal escrita), el menu expiraria y arrancaria Fedora normal:
+# un fallo BENIGNO pero INVISIBLE, y ese apagado no ahorraria nada.
+#
+# Se cierra con los TIEMPOS DE FIRMWARE del arranque siguiente. ACPI FPDT
+# (/sys/firmware/acpi/fpdt/boot) los da en crudo, sin parsear texto de
+# systemd-analyze:
+#     exitbootservice_end_ns = firmware + gestor de arranque = UNA PASADA POST+GRUB
+# y el instante en que arranco ese firmware sale de
+#     (ahora - uptime) - exitbootservice_end
+#
+# Si GRUB apago, entre el reset que dio la politica y el encendido siguiente
+# tiene que caber UNA PASADA ENTERA DE MAS —la que acabo en `halt`— mas el rato
+# que el equipo estuvo sin corriente. Si GRUB NO apago y arranco Fedora
+# directamente, ese reset ES el inicio de firmware y el hueco se queda en la
+# cola de systemd-shutdown, muy por debajo de una pasada.
+#
+# Primer disparo real, 2026-08-11 10:11: hueco 29,8 s frente a 11,5 s de una
+# pasada (5,4 POST + 6,2 GRUB) => sobraban ~18 s. GRUB apago. Y de propina el
+# metodo se corrobora solo: inicio de firmware + una pasada = 10:13:40, y la
+# primera linea del journal de ese arranque es de 10:13:41.
+#
+# NUNCA da FALLO, solo AVISO: el metodo supone que la cola de systemd-shutdown
+# es corta, y no se grita por una suposicion (regla 27). Los dos escenarios se
+# separan por ~20 s, asi que el margen de 5 s no roza ninguno.
+FPDT=${FPDT:-/sys/firmware/acpi/fpdt/boot/exitbootservice_end_ns}   # overridable para ensayar (regla 22)
+# INSTANTE EN QUE ARRANCO EL KERNEL DE ESTE ARRANQUE, epoch = (ahora - uptime).
+# Overridable SOLO para ensayar (regla 22), y sin el las ramas de aqui abajo NO
+# se pueden ensayar: el veredicto depende de cuanto estuvo el equipo apagado DE
+# VERDAD, que es justo lo que unos fixtures no controlan. Con una noche larga
+# por medio el hueco sale de horas y la rama que DEBE avisar salia VERDE por
+# accidente — o sea que el ensayo pasaba o fallaba segun a que hora se corriera.
+# Pinchando esto, cada escenario se construye entero. Ver tests/ensayo-ramas.sh.
+ARRANQUE=${ARRANQUE:-}
+PROCUPTIME=${PROCUPTIME:-/proc/uptime}   # overridable SOLO para ensayar la rama de abstencion (regla 22)
+# Segundos que el equipo estuvo SIN CORRIENTE. Lo calcula esta seccion y lo
+# consume la 10: es lo unico que separa un desvio por GRUB que se comio la
+# ventana de otro que no la toco. Vacio = no se ha podido saber.
+S5_REAL_S=''
+S5_INCOHERENTE=''   # fraccion imposible (>100%): las dos fuentes no cuadran
+if [ -z "$POL_GRUB_TS" ]; then
+    :   # el ultimo apagado no se desvio por GRUB: aqui no hay nada que mirar
+elif [ ! -r "$FPDT" ]; then
+    di "  [ -- ]   sin ACPI FPDT en esta plataforma: no se puede comprobar si GRUB llego a apagar"
+else
+    fpdt_ns="$(cat "$FPDT" 2>/dev/null)"
+    # `%d` trunca el epoch con decimales de `short-unix` y deja 0 si no hay
+    # arranque anterior en el journal (o si journalctl falla): asi el test de
+    # abajo es aritmetica de enteros y no revienta.
+    finant="$(journalctl -b -1 -n1 -o short-unix --no-pager 2>/dev/null | awk 'END{printf "%d", $1}')"
+    polep="$(ep "$POL_GRUB_TS")"
+    arr="$ARRANQUE"
+    if [ -z "$arr" ]; then
+        upt="$(cut -d' ' -f1 "$PROCUPTIME" 2>/dev/null)"
+        [ -n "$upt" ] && arr="$(awk -v a="$(date +%s)" -v u="$upt" 'BEGIN{printf "%.1f", a - u}')"
+    fi
+    if ! printf '%s' "$fpdt_ns" | grep -qE '^[0-9]+$' || [ "$fpdt_ns" = 0 ] || [ -z "$arr" ]; then
+        di "  [ -- ]   ACPI FPDT no trae tiempos utiles: no se comprueba el apagado por GRUB"
+    elif [ -z "$finant" ] || [ "$finant" = 0 ] || [ -z "$polep" ]; then
+        di "  [ -- ]   sin journal del arranque anterior: no se puede comprobar si GRUB llego a apagar"
+    elif [ "$polep" -gt "$finant" ] || [ $((finant - polep)) -gt 900 ]; then
+        # El desvio por GRUB no fue el apagado que precede a ESTE arranque (se
+        # ha reiniciado por otra cosa desde entonces): los tiempos de firmware
+        # de ahora ya no dicen nada de aquel.
+        di "  [ -- ]   el desvio por GRUB no fue el apagado inmediatamente anterior: los tiempos de firmware ya no lo cubren"
+    else
+        set -- $(awk -v ns="$fpdt_ns" -v fin="$finant" -v arr="$arr" 'BEGIN{
+            pasada = ns / 1000000000
+            hueco  = (arr - pasada) - fin
+            printf "%.1f %.1f %.1f", hueco, pasada, hueco - pasada
+        }')
+        hueco=$1; pasada=$2; sobra=$3
+        # Se publica tambien cuando la rama de abajo AVISA: ahi `sobra` sale de
+        # segundos, y eso es justo lo que hace que la 10 se abstenga. Un dato
+        # malo no se esconde, se deja hablar.
+        S5_REAL_S="$sobra"
+        if awk -v s="$sobra" 'BEGIN{exit !(s+0 > 5)}'; then
+            ok "politica: GRUB APAGO DE VERDAD — ${hueco}s entre el reset y el encendido siguiente frente a ${pasada}s de una pasada POST+GRUB: sobran ${sobra}s de equipo sin corriente"
+        else
+            aviso "politica: NO se ve la pasada extra de POST+GRUB (hueco ${hueco}s, una pasada ${pasada}s). GRUB pudo no ejecutar el 'halt' y arrancar Fedora directamente: ese apagado NO ahorro nada. Comprueba que este GRUB trae el comando 'halt'"
+        fi
+    fi
+fi
+
+# --- 10. lo unico que discrimina de verdad: la energia (regla 3) ------------
+# OJO AL `tail -1`: hay que mirar el resumen del ULTIMO APAGADO, no el ultimo
+# resumen que traiga vatios. Lo de antes hacia `grep 'W medios en S5' | tail -1`
+# y se quedaba pegado a la ultima medida con vatios aunque fuera de otra prueba
+# y de horas antes: el 2026-08-11 canto FALLO por los 35,92 W de
+# 'pmrt-solo-a-v2', que era de 43 min antes Y ADEMAS no era una medida de S5
+# (colgo la maquina; ver "Why both halves of the shield are inseparable" en
+# docs/EVIDENCE.md) — mientras que el apagado real de despues habia ido
+# perfecto. Un falso FALLO aqui es caro: es la forma mas rapida de que nadie
+# vuelva a creerse este informe.
+#
+# Y HAY UNA SEGUNDA VENTANA QUE PUEDE NO MEDIR UN S5: la de un apagado desviado
+# por GRUB. Ahi la ventana de s5-energy-log va del `poweroff` al arranque
+# siguiente e incluye LA MANIOBRA ENTERA con el equipo despierto — la espera de
+# la politica a ~19 W (hasta MAXWAIT=90 s), el reinicio, dos POST y el arranque.
+# Medido el 2026-08-11 10:11: 26,38 W de "media en S5" que se desglosan en
+# 19,49 W durante los 94 s de espera + 0,539 Wh de reinicio y arranques.
+# Aplicarle el umbral de 4 W a eso da un FALLO ROTUNDO Y FALSO justo cuando la
+# politica ha hecho bien su trabajo.
+#
+# PERO EL DESVIO POR SI SOLO NO INVALIDA LA VENTANA, y darlo por hecho era un
+# error caro en el otro sentido. La maniobra dura LO MISMO SIEMPRE (~2 min):
+# en una ventana de 20 min se come la medida, y en una noche entera no se nota.
+# El 2026-08-14 la politica desvio por GRUB una noche de 9,55 h que midio
+# 0,32 W —la cifra mas baja de toda la serie, y la unica que ensaya el caso raro
+# de punta a punta— y esta seccion la despacho con "el S5 real duro segundos",
+# que era falso: duro 9,52 h, y el propio informe lo decia tres lineas mas
+# arriba. La mejor medida de la serie se publico como "no aplica".
+#
+# Lo que separa los dos casos ya lo calcula 9ter: `sobra`, los segundos SIN
+# CORRIENTE. Si cubren >=95% de la ventana, la maniobra es ruido y el umbral
+# aplica. Por debajo, se abstiene — pero diciendo los numeros, no una frase
+# hecha (regla 27: un informe que canta lo que no ha medido deja de leerse).
+#
+# APLICAR EL UMBRAL AHI NO PUEDE DAR UN FALSO APROBADO: lo que queda fuera del
+# S5 es tiempo DESPIERTO a ~19 W, o sea que solo puede EMPUJAR LA MEDIA HACIA
+# ARRIBA. La cifra que sale es un TECHO del consumo real en S5, nunca un suelo,
+# y por eso pasar el umbral con ella es concluyente sin suponer nada sobre
+# cuanto gasta la maniobra (regla 31: si una salvedad depende de una magnitud, se
+# calcula la magnitud, no se redacta — no se mete una constante en un veredicto).
+med="$(grep -E '^ *=> APAGADO ' "$ELOG" 2>/dev/null | tail -1)"
+# El resumen `=>` no lleva fecha; la del apagado al que pertenece esta en la
+# linea `APAGADO` de encima. Hace falta para correlacionarlo con la politica:
+# sin eso, un desvio por GRUB de hace tres apagados taparia una medida buena.
+medts="$(awk '$1 ~ /^20[0-9][0-9]-/ && $3 == "APAGADO" { ts = $1 " " $2 }
+              /^ *=> APAGADO / { ult = ts }
+              END { print ult }' "$ELOG" 2>/dev/null)"
+grubwin=0
+if [ -n "$POL_GRUB_TS" ] && [ -n "$medts" ]; then
+    pe="$(ep "$POL_GRUB_TS")"; me="$(ep "$medts")"
+    # La politica corre al final del apagado, o sea DESPUES de que s5-energy-log
+    # escriba su linea `APAGADO`, y con MAXWAIT=90 nunca mas de un par de
+    # minutos despues. 600 s de holgura y exigiendo el orden correcto.
+    [ -n "$pe" ] && [ -n "$me" ] && [ "$pe" -ge "$me" ] && [ $((pe - me)) -le 600 ] && grubwin=1
+fi
+
+# ¿cuanto de la ventana fue S5 de verdad? grubwin=2 => la maniobra es ruido y
+# la medida vale. La ventana se lee del propio resumen, que la trae en horas.
+#
+# EL LIMITE DE ARRIBA NO ES SIMETRIA, ES UNA CONTRADICCION QUE HAY QUE CAZAR: la
+# ventana de energia EMPIEZA ANTES del reset y ACABA DESPUES del encendido, o sea
+# que CONTIENE al S5 y la fraccion real no puede pasar del 100%. Si pasa, las dos
+# fuentes no estan hablando del mismo apagado (tiempos de firmware de otro
+# arranque, journal desplazado, un desvio viejo que aun correlaciona) y entonces
+# no se sabe nada: se abstiene. Sin esta guarda, un 23795% —que es lo que dio el
+# ensayo en cuanto se le colo el reloj de la maquina— entraba como ">=95" y
+# APROBABA. Justo el falso aprobado que esta seccion dice que no puede darse.
+# El 105 es holgura de redondeo: la ventana viene en horas con dos decimales
+# (+-18 s), que en una noche no se nota y en una ventana corta nunca llega al 95.
+S5_FRAC=''
+if [ "$grubwin" = 1 ] && [ -n "$S5_REAL_S" ]; then
+    vent_h="$(printf '%s' "$med" | sed -E 's/.*=> APAGADO +([0-9.]+) h .*/\1/')"
+    if printf '%s' "$vent_h" | grep -qE '^[0-9]+(\.[0-9]+)?$'; then
+        S5_FRAC="$(awk -v s="$S5_REAL_S" -v h="$vent_h" \
+                       'BEGIN{ v = h*3600; if (v <= 0) exit 1; printf "%.1f", 100*s/v }')" || S5_FRAC=''
+        if [ -n "$S5_FRAC" ] && awk -v f="$S5_FRAC" 'BEGIN{exit !(f+0 > 105)}'; then
+            S5_INCOHERENTE="$S5_FRAC"; S5_FRAC=''
+        elif [ -n "$S5_FRAC" ] && awk -v f="$S5_FRAC" 'BEGIN{exit !(f+0 >= 95)}'; then
+            grubwin=2
+        fi
+    fi
+fi
+
+w="$(printf '%s' "$med" | sed -E 's/.*=  *([0-9.]+) W medios.*/\1/')"
+if [ -z "$med" ]; then
+    aviso "no hay ningun resumen '=> APAGADO' en $ELOG"
+elif printf '%s' "$med" | grep -q 'no es medible'; then
+    di "  [ -- ]   el ultimo apagado fue ENCHUFADO: el vataje no es medible asi (la bateria estaba cargando)"
+elif [ "$grubwin" = 1 ]; then
+    di "  [ -- ]   el ultimo apagado se DESVIO POR GRUB ($POL_GRUB_TS): la ventana medida ($w W) NO es un S5 y el umbral de $UMBRAL_W W no aplica"
+    if [ -n "$S5_FRAC" ]; then
+        di "  [ -- ]     de la ventana, solo el ${S5_FRAC}% fue S5 real ($(dur "$S5_REAL_S")); el resto es la maniobra despierta (espera de la politica a ~19 W + reinicio + dos POST)"
+    elif [ -n "$S5_INCOHERENTE" ]; then
+        di "  [ -- ]     y ademas los tiempos NO CUADRAN: el S5 reconstruido ($(dur "$S5_REAL_S")) sale mas largo que la propia ventana (${S5_INCOHERENTE}%), asi que las dos fuentes no hablan del mismo apagado y no se concluye nada"
+    else
+        di "  [ -- ]     no se ha podido medir cuanto de la ventana fue S5 real; incluye la maniobra despierta (espera de la politica a ~19 W + reinicio + dos POST)"
+    fi
+    di "  [ -- ]     el ahorro de esta rama se cobra en horas de apagado, no en el minuto de la maniobra"
+else
+    [ "$grubwin" = 2 ] && \
+        di "  [ -- ]   el apagado se desvio por GRUB ($POL_GRUB_TS), pero el S5 real cubrio el ${S5_FRAC}% de la ventana ($(dur "$S5_REAL_S")): la medida SI vale, y es un techo (la maniobra solo puede subirla)"
+    if ! printf '%s' "$w" | grep -qE '^[0-9]+(\.[0-9]+)?$'; then
+        aviso "no se pudo leer el vataje del ultimo apagado: $med"
+    elif awk -v w="$w" 'BEGIN{exit !(w+0 > 30)}'; then
+        # Regla 4: 30-65 W es la maquina DESPIERTA, o sea un cuelgue. No es una
+        # medida de S5 y no se apunta. La mas alta legitima jamas medida fue
+        # 26,56 W ('pm1a-acpica'), asi que 30 separa sin ambiguedad.
+        aviso "el ultimo apagado marco $w W: eso no es un S5, es un CUELGUE (regla 4). Medida NULA, no cuenta"
+    elif awk -v w="$w" -v u="$UMBRAL_W" 'BEGIN{exit !(w+0 > u)}'; then
+        fallo "el ultimo apagado medido gasto $w W (umbral $UMBRAL_W W) => NO estuvo mitigado"
+    else
+        ok "ultimo apagado medido: $w W"
+    fi
+fi
+
+# --- veredicto -------------------------------------------------------------
+di
+if [ "$fallos" -gt 0 ]; then
+    veredicto "VEREDICTO: $fallos FALLO(S), $avisos aviso(s) — LA MITIGACION NO ESTA GARANTIZADA"
+    if [ "$MODO" = boot ]; then
+        { printf 'La mitigacion del drenaje en S5 (dGPU) NO esta garantizada:\n'
+          printf '  - %s\n' "${motivos[@]}"
+          printf 'Detalle: s5-mitigacion-check\n'; } > "$MARKER" 2>/dev/null
+        { printf 'AVISO s5: la mitigacion del drenaje en S5 NO esta garantizada.\n'
+          printf '%s\n' "${motivos[@]}"
+          printf 'Ejecuta: s5-mitigacion-check\n'; } | wall 2>/dev/null
+    fi
+    exit 1
+fi
+
+# OJO CON `${avisos:+...}`: en bash `0` NO es nulo, asi que expandia igual y una
+# pasada perfecta acababa diciendo "TODO EN ORDEN (0 aviso(s))" — justo la linea
+# que el README y install.sh prometen limpia, y la unica que lee mucha gente. Hay
+# que comparar el numero, no preguntar si la variable esta puesta.
+sufijo=''
+[ "$avisos" -gt 0 ] && sufijo=" ($avisos aviso(s))"
+veredicto "VEREDICTO: TODO EN ORDEN$sufijo — el proximo apagado deberia costar ~2 W"
+[ "$MODO" = boot ] && rm -f "$MARKER" 2>/dev/null
+exit 0

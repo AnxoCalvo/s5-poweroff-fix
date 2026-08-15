@@ -1,0 +1,32 @@
+# Rotacion de los dos logs de s5-poweroff-fix.
+#
+# CUANTO CRECEN: ~5 KB por apagado (4,7 KB el de PCI, 363 B el de energia),
+# medido sobre un apagado real completo. A 2 apagados/dia son ~3,7 MB al ano:
+# no molesta, pero sin rotacion no tiene tope, y quien instale esto no deberia
+# heredar un fichero que crece para siempre.
+#
+# POR QUE `minsize` Y NO ROTACION A SECAS: el log de energia ES LA BASE DE
+# EVIDENCIA de este proyecto — cada linea es una medida de consumo en S5 que no
+# se puede repetir sin volver a apagar el equipo una noche. `monthly` a secas
+# lo trocearia cada mes aunque tuviera 40 KB. Con `minsize 1M` solo rota cuando
+# de verdad hay bulto (~200 apagados), y `rotate 24` guarda dos anos.
+#
+# NO hace falta `copytruncate`: los dos escritores (el hook de apagado y
+# s5-energy-log) abren con `>>` en cada escritura, no mantienen el descriptor,
+# asi que el renombrado normal de logrotate es correcto y no pierde lineas.
+#
+# EFECTO EN EL VERIFICADOR: `s5-mitigacion-check` solo lee el fichero vivo. Si
+# una rotacion cayera justo entre un apagado y el arranque siguiente, no
+# encontraria el ultimo bloque y daria AVISO — no FALLO. Comprobado.
+/var/log/s5-shutdown-pci.log
+/var/log/s5-energy.log
+{
+    monthly
+    minsize 1M
+    rotate 24
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 root root
+}

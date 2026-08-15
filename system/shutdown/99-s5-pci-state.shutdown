@@ -1,0 +1,226 @@
+#!/bin/bash
+# /usr/lib/systemd/system-shutdown/99-s5-pci-state.shutdown
+#
+# Se ejecuta como ULTIMO paso de userspace, despues de desmontar y justo antes
+# del reboot()/poweroff() del kernel. Registra el estado real de energia de todo
+# el bus PCI en ese instante, para saber si el camino de apagado de Fedora deja
+# la dGPU (o cualquier otro dispositivo) despierta.
+#
+# $1 = poweroff | reboot | halt | kexec
+#
+# Solo lee sysfs. NUNCA lspci: leer el espacio de configuracion dispara un
+# runtime-resume y falsea la medida — y no solo lspci, tambien
+# `cat /proc/asound/cards` y `nvidia-smi` (regla 20 en docs/EVIDENCE.md, que se
+# aprendio perdiendo medidas por esto mismo).
+#
+# 2026-08-09, FASE 2: ademas de medir, INTENTA ARREGLAR. El hook del 13:29
+# demostro que el apagado despierta la dGPU (nvidia-powerd al pararse hace
+# runtime-resume ~3 s antes del corte) y que ya no le da tiempo a volver a
+# dormirse. Medido en caliente: el autosuspend del driver nvidia tarda ~20 s.
+# Aqui, sin userspace vivo, nadie retiene /dev/nvidia0, asi que basta con
+# ESPERAR a que el temporizador de runtime PM haga su trabajo. Espera acotada:
+# sale en cuanto llega a D3cold, y se rinde a los MAXWAIT segundos pase lo que
+# pase (nunca puede colgar el apagado).
+#
+# 2026-08-10, GUARDA DEL CONTROL: si existe el flag $CONTROL_D0, este hook NO
+# toca power/control y NO espera a D3cold. Hace falta porque este bloque anulo
+# en silencio el control 'gpu-d0-pm1a-control' (17:00): el previo habia clavado
+# el subarbol de la discreta en D0 (control=on) y este hook lo deshizo con su
+# 'echo auto', asi que la dGPU se durmio igual (traza 0:D0 23:D3hot 25:D3cold) y
+# la medida repitio v3 en vez de controlarla. OJO: systemd-shutdown ejecuta los
+# ejecutables de este directorio EN PARALELO, no por orden alfabetico (los dos
+# hooks arrancaron a las 17:00:50,5 y sus dos esperas acabaron juntas a las
+# 17:01:03), asi que la guarda TIENE que estar aqui dentro: no hay orden de
+# nombres que arregle esto. El flag es de un solo uso: se borra abajo, en la
+# primera ventana de escritura, o sea en cuanto este hook empieza.
+#
+# S5_PCI_DRYRUN=1 (por entorno) => no remonta / (ni rw ni ro), no escribe en
+# power/control, acorta la espera a 2 s y desvia el log a /tmp. Sirve para
+# probar ESTE script en caliente sin gastar una ventana ni tocar el historial.
+
+ACTION="$1"
+LOG=/var/log/s5-shutdown-pci.log
+# QUE dispositivos. Antes estaban clavados aqui (GPU=0000:01:00.0 y compania), o
+# sea los de la maquina donde se diagnosticó esto. En cualquier otra, ese BDF
+# puede ser el NVMe: este hook no solo LEE, tambien escribe `auto` en
+# power/control (mas abajo), y ademas sus testigos son los que luego lee
+# `s5-mitigacion-check` — con los BDF equivocados el informe sale verde y sin
+# sentido. Salen de sysfs; ver s5-descubre-dgpu.
+DESCUBRE=${S5_DESCUBRE:-/usr/local/bin/s5-descubre-dgpu}   # overridable SOLO para ensayar (regla 22)
+GPU=''; AUDIO=''; BRIDGE=''
+# shellcheck source=/dev/null
+[ -r "$DESCUBRE" ] && . "$DESCUBRE"
+MAXWAIT=35          # segundos maximos de espera a que la dGPU llegue a D3cold
+POLL=0.5
+CONTROL_D0=/var/lib/s5-test/gpu-d0-control   # flag: dejar la dGPU DESPIERTA
+
+DRYRUN="${S5_PCI_DRYRUN:-0}"
+if [ "$DRYRUN" = 1 ]; then
+    LOG="${S5_PCI_LOG:-/tmp/p3-dryrun-pci-state.log}"
+    MAXWAIT=2
+fi
+
+# la guarda se lee UNA vez, al principio, antes de que nadie pueda borrarla
+SALTADO=0
+if [ -e "$CONTROL_D0" ]; then SALTADO=1; fi
+
+# lectura segura: nunca bloquea el apagado si un fichero no existe
+rd() { local v=''; read -r v < "$1" 2>/dev/null; printf '%s' "${v:-?}"; }
+# nombre del driver enlazado, o '-' si no hay ninguno
+drv() { if [ -e "$1/driver" ]; then basename "$(readlink -f "$1/driver")"; else printf -- '-'; fi; }
+
+# / esta en solo lectura en este punto; se abre lo justo y se vuelve a cerrar
+rw() { if [ "$DRYRUN" = 1 ]; then return 0; fi; mount -o remount,rw / 2>/dev/null; }
+ro() { sync; if [ "$DRYRUN" = 1 ]; then return 0; fi; mount -o remount,ro / 2>/dev/null; }
+
+# LA BATERIA, DESCUBIERTA. Antes era `BAT0` clavado, que aqui acierta y en un
+# portatil con BAT1 (comunes en Lenovo y Dell) leeria vacio EN SILENCIO — y esta
+# es la lectura de energia con la que se cierra el hueco final de la medida.
+# Mismo criterio que s5-energy-log, que ya lo hacia bien.
+BAT="${S5_BAT:-$(ls -d /sys/class/power_supply/BAT* 2>/dev/null | head -1)}"
+
+# SIN dGPU LOCALIZADA NO SE IMPROVISA. Ojo a la trampa: con $GPU vacio,
+# `/sys/bus/pci/devices/$GPU` es `/sys/bus/pci/devices/`, que EXISTE — asi que
+# todo `[ -d ... ]` daria verdadero y el hook escribiria y mediria la nada
+# creyendo que acierta. Se dice y no se toca ningun dispositivo; la tabla PCI
+# completa de mas abajo se sigue volcando, que es util igual.
+SIN_DGPU=0
+[ -n "$GPU" ] || SIN_DGPU=1
+
+estado_clave() {   # $1 = etiqueta del bloque
+    if [ "$SIN_DGPU" = 1 ]; then
+        printf 'VEREDICTO_%s sin dGPU localizada: nada que vigilar\n' "$1"
+        return
+    fi
+    printf 'VEREDICTO_%s dGPU=%s/%s  audio=%s/%s  puente=%s/%s\n' "$1" \
+        "$(rd /sys/bus/pci/devices/$GPU/power_state)" \
+        "$(rd /sys/bus/pci/devices/$GPU/power/runtime_status)" \
+        "$(rd /sys/bus/pci/devices/$AUDIO/power_state)" \
+        "$(rd /sys/bus/pci/devices/$AUDIO/power/runtime_status)" \
+        "$(rd /sys/bus/pci/devices/$BRIDGE/power_state)" \
+        "$(rd /sys/bus/pci/devices/$BRIDGE/power/runtime_status)"
+}
+
+# ---------------------------------------------------------------- ANTES ------
+rw || exit 0   # sin sitio donde escribir; no retrasar el apagado
+{
+    printf '\n===== %s  accion=%s  kernel=%s\n' \
+        "$(date '+%F %T')" "$ACTION" "$(rd /proc/sys/kernel/osrelease)"
+
+    # --- energia de la bateria en el instante final (el s5-energy-log se
+    #     ejecuta antes, en el ExecStop; esto cierra el hueco) ---
+    printf 'BAT  energy_now=%s uWh  status=%s  power_now=%s uW\n' \
+        "$(rd "$BAT/energy_now")" \
+        "$(rd "$BAT/status")" \
+        "$(rd "$BAT/power_now")"
+
+    [ "$SIN_DGPU" = 1 ] && printf '!!! sin dGPU localizada (%s): este hook solo OBSERVA; el S5 puede costar ~18-20 W\n' \
+        "$([ -r "$DESCUBRE" ] && echo 's5-descubre-dgpu no encontro ninguna' || echo "falta $DESCUBRE")"
+
+    # --- los tres dispositivos que importan, en detalle ---
+    for d in "$BRIDGE" "$GPU" "$AUDIO"; do
+        [ -n "$d" ] || continue
+        b=/sys/bus/pci/devices/$d
+        [ -d "$b" ] || { printf 'CLAVE %s  AUSENTE del bus\n' "$d"; continue; }
+        printf 'CLAVE %s  power_state=%-7s runtime_status=%-10s driver=%-13s d3cold_allowed=%s control=%s suspendido_ms=%s activo_ms=%s\n' \
+            "$d" \
+            "$(rd $b/power_state)" \
+            "$(rd $b/power/runtime_status)" \
+            "$(drv $b)" \
+            "$(rd $b/d3cold_allowed)" \
+            "$(rd $b/power/control)" \
+            "$(rd $b/power/runtime_suspended_time)" \
+            "$(rd $b/power/runtime_active_time)"
+    done
+
+    # --- tabla PCI completa: cualquiera que no este en D3 es sospechoso ---
+    printf '%-13s %-7s %-10s %s\n' DISPOSITIVO ESTADO RUNTIME DRIVER
+    for b in /sys/bus/pci/devices/*; do
+        printf '%-13s %-7s %-10s %s\n' \
+            "${b##*/}" \
+            "$(rd $b/power_state)" \
+            "$(rd $b/power/runtime_status)" \
+            "$(drv $b)"
+    done
+
+    estado_clave ANTES
+
+    if [ "$SALTADO" = 1 ]; then
+        printf 'CONTROL D0: GUARDA ACTIVA (%s) => este hook NO escribe power/control\n' "$CONTROL_D0"
+        printf 'CONTROL D0: ...y NO espera a D3cold. La dGPU debe llegar al S5 DESPIERTA.\n'
+        printf 'CONTROL D0: la medida SOLO vale si VEREDICTO_ANTES y VEREDICTO_DESPUES dicen los dos dGPU=D0,\n'
+        printf 'CONTROL D0: y el "PMRT TESTIGO justo antes de blindar" del hook 99y tambien.\n'
+        printf 'CONTROL D0: Si alguno dice D3cold, NO VALE (estaria repitiendo una medida limpia cualquiera).\n'
+    fi
+
+    # --- temperaturas: el chasis se calienta en S5, ver si ya viene caliente ---
+    for t in /sys/class/thermal/thermal_zone*; do
+        [ -d "$t" ] || continue
+        printf 'TEMP %s %s %s\n' "${t##*/}" "$(rd $t/type)" "$(rd $t/temp)"
+    done
+} >> "$LOG" 2>/dev/null
+
+# flag de un solo uso: se borra YA, con / todavia en rw y antes de la espera de
+# mas abajo, que es la parte larga de este hook. Si se dejara para el bloque
+# DESPUES, un apagado mas rapido podria dejarlo puesto y envenenar el siguiente
+# apagado normal (que se quedaria sin el arreglo de D3cold sin que nadie se
+# entere). Ademas es lo unico que impide que un corte a mitad de la espera lo
+# deje armado para siempre.
+if [ "$SALTADO" = 1 ] && [ "$DRYRUN" != 1 ]; then
+    rm -f "$CONTROL_D0"
+fi
+ro
+
+# ------------------------------------------------- ESPERA A D3cold -----------
+# Sin escrituras a disco durante la espera: / vuelve a estar en ro.
+TRAZA=''
+ESPERADO=0
+if [ "$SALTADO" = 1 ]; then
+    TRAZA=' (guarda del control: no se espera, la dGPU va DESPIERTA a proposito)'
+elif [ "$SIN_DGPU" = 1 ]; then
+    TRAZA=' (sin dGPU localizada: no se espera ni se toca power/control)'
+elif [ -d /sys/bus/pci/devices/$GPU ] && [ "$(rd /sys/bus/pci/devices/$GPU/power_state)" != D3cold ]; then
+    # asegurar que el runtime PM esta habilitado en la rama entera
+    if [ "$DRYRUN" != 1 ]; then
+        for d in "$GPU" "$AUDIO" "$BRIDGE"; do
+            [ -n "$d" ] || continue
+            echo auto > /sys/bus/pci/devices/$d/power/control 2>/dev/null
+        done
+    fi
+
+    ANT=''
+    N=$(echo "$MAXWAIT / $POLL" | bc 2>/dev/null); [ -n "$N" ] || N=70
+    i=0
+    while [ "$i" -lt "$N" ]; do
+        EST=$(rd /sys/bus/pci/devices/$GPU/power_state)
+        if [ "$EST" != "$ANT" ]; then
+            TRAZA="$TRAZA ${i}:${EST}"   # i en unidades de POLL
+            ANT="$EST"
+        fi
+        [ "$EST" = D3cold ] && break
+        sleep "$POLL"
+        i=$((i + 1))
+    done
+    ESPERADO=$i
+fi
+
+# --------------------------------------------------------------- DESPUES ----
+rw || exit 0
+{
+    printf 'ESPERA  ciclos=%s (x%s s, max %s s)  traza(ciclo:estado):%s\n' \
+        "$ESPERADO" "$POLL" "$MAXWAIT" "${TRAZA:- (no hizo falta esperar)}"
+    for d in "$BRIDGE" "$GPU" "$AUDIO"; do
+        [ -n "$d" ] || continue
+        b=/sys/bus/pci/devices/$d
+        [ -d "$b" ] || continue
+        printf 'FINAL %s  power_state=%-7s runtime_status=%-10s suspendido_ms=%s activo_ms=%s\n' \
+            "$d" "$(rd $b/power_state)" "$(rd $b/power/runtime_status)" \
+            "$(rd $b/power/runtime_suspended_time)" "$(rd $b/power/runtime_active_time)"
+    done
+    estado_clave DESPUES
+    printf 'BAT_FINAL energy_now=%s uWh  power_now=%s uW\n' \
+        "$(rd "$BAT/energy_now")" \
+        "$(rd "$BAT/power_now")"
+} >> "$LOG" 2>/dev/null
+ro
+exit 0

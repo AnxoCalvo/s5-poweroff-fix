@@ -1,0 +1,363 @@
+#!/bin/bash
+# s5-test — automatiza una prueba de consumo en S5 de principio a fin.
+#
+# Ver s5-energy-log (el medidor) y /var/log/s5-energy.log (el log de resultados).
+#
+# Uso:
+#   s5-test [-m MIN] [-a 'ARGS_KERNEL'] [-p 'COMANDOS'] [-w SEG] [-f] ETIQUETA
+#   s5-test abort     — cancela una prueba armada y deja el equipo como estaba
+#   s5-test status    — que hay armado ahora mismo
+#
+# Ejemplos:
+#   s5-test -m 35 -p 'echo 1 > /sys/bus/pci/devices/0000:01:00.1/remove
+#                     echo 1 > /sys/bus/pci/devices/0000:01:00.0/remove'  gpu-fuera
+#   s5-test -m 35 -a 'acpi_osi="!Windows 2020"'                           acpi-osi
+#
+# Fases (los args de kernel deben estar activos en la sesion que APAGA, de ahi el reinicio):
+#   1  usuario: valida, parchea las entradas BLS, activa la unidad, reinicia
+#   2  al arrancar: espera la ventana de aborto, ejecuta -p, arma el RTC, apaga
+#   3  al despertar: s5-energy-log calcula los vatios; se anota el resultado y se limpia
+
+set -u
+
+STATE_DIR=/var/lib/s5-test
+STATE="$STATE_DIR/state"
+PENDING="$STATE_DIR/pending"
+ABORT_FLAG="$STATE_DIR/abort"
+BLS_BAK="$STATE_DIR/bls-backup"
+# SOLO FEDORA/RHEL/SUSE: parchear los args de kernel por aqui asume la
+# disposicion BLS. En Debian/Ubuntu/Arch este directorio no existe y el respaldo
+# de mas abajo mata el script con un mensaje claro — falla ruidosamente, que es
+# lo correcto para una herramienta de medida que solo usa quien investiga.
+BLS_DIR=${S5_BLS_DIR:-/boot/loader/entries}
+LOG=/var/log/s5-energy.log
+RUN_UNIT=s5-test-run.service
+S5_CONF=${S5_CONF:-/etc/s5-poweroff-fix.conf}
+# shellcheck source=/dev/null
+[ -r "$S5_CONF" ] && . "$S5_CONF"
+BAT="${S5_BAT:-$(ls -d /sys/class/power_supply/BAT* 2>/dev/null | head -1)}"
+
+die()  { echo "s5-test: $*" >&2; exit 1; }
+info() { echo "s5-test: $*"; }
+logline() { printf '%s\n' "$*" >> "$LOG"; }
+
+need_root() { [ "$(id -u)" = 0 ] || die "hay que ejecutarlo como root (sudo)"; }
+
+on_battery() {
+    for a in /sys/class/power_supply/AC* /sys/class/power_supply/ADP*; do
+        [ -r "$a/online" ] && { [ "$(cat "$a/online")" = 0 ]; return; }
+    done
+    return 1
+}
+
+# Aviso en el escritorio, si hay una sesion grafica abierta (best effort)
+notify_desktop() {
+    local uid
+    uid=$(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $2; exit}')
+    [ -n "${uid:-}" ] || return 0
+    local user; user=$(id -nu "$uid" 2>/dev/null) || return 0
+    runuser -u "$user" -- env DISPLAY=:0 \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+        notify-send -u critical "$1" "$2" >/dev/null 2>&1 || true
+}
+
+bat_wh()  { awk '{printf "%.3f", $1/1000000}' "$BAT/energy_now" 2>/dev/null; }
+bat_pct() { cat "$BAT/capacity" 2>/dev/null; }
+
+# ---------------------------------------------------------------- limpieza
+restore_bls() {
+    if [ -d "$BLS_BAK" ] && ls "$BLS_BAK"/*.conf >/dev/null 2>&1; then
+        cp -a "$BLS_BAK"/*.conf "$BLS_DIR"/ && rm -rf "$BLS_BAK"
+        info "entradas de arranque restauradas"
+    fi
+}
+
+disarm() {
+    systemctl disable "$RUN_UNIT" >/dev/null 2>&1
+    restore_bls
+    echo 0 > /sys/class/rtc/rtc0/wakealarm 2>/dev/null
+    rm -f "$STATE" "$ABORT_FLAG"
+}
+
+# ---------------------------------------------------------------- subcomandos
+cmd_abort() {
+    need_root
+    [ -e "$STATE" ] || info "no habia ninguna prueba armada; limpio por si acaso"
+    : > "$ABORT_FLAG"          # lo ve la fase 2 si esta en su cuenta atras
+    sleep 2
+    disarm
+    rm -f "$PENDING"
+    info "prueba abortada. El equipo NO se apagara."
+}
+
+cmd_status() {
+    if [ -e "$STATE" ]; then
+        echo "--- prueba armada ---"; cat "$STATE"
+    elif [ -e "$PENDING" ]; then
+        echo "--- prueba en curso (esperando el arranque tras el S5) ---"; cat "$PENDING"
+    else
+        echo "no hay ninguna prueba armada"
+    fi
+    echo "--- unidad fase 2 (reinicio): $(systemctl is-enabled $RUN_UNIT 2>&1 | head -1)"
+    echo "--- wakealarm: $(cat /sys/class/rtc/rtc0/wakealarm 2>/dev/null)"
+    echo "--- entradas BLS parcheadas: $([ -d "$BLS_BAK" ] && echo si || echo no)"
+    echo "--- bateria: $(bat_pct)%  $(bat_wh) Wh  $(on_battery && echo 'a bateria' || echo enchufado)"
+}
+
+# ---------------------------------------------------------------- fase 2
+cmd_phase2() {
+    need_root
+    [ -r "$STATE" ] || die "fase 2 sin estado; nada que hacer"
+    # shellcheck disable=SC1090
+    . "$STATE"
+
+    # Pase lo que pase a partir de aqui, el equipo no debe quedar en bucle:
+    # se desarma la unidad y se restauran las entradas de arranque YA.
+    systemctl disable "$RUN_UNIT" >/dev/null 2>&1
+    restore_bls
+    rm -f "$ABORT_FLAG"
+
+    if [ -n "$ARGS" ]; then
+        # Verificar que los argumentos pedidos estan realmente activos
+        local_ok=1
+        for tok in $ARGS; do
+            grep -qF -- "${tok%%=*}" /proc/cmdline || local_ok=0
+        done
+        if [ "$local_ok" != 1 ]; then
+            logline "### PRUEBA $LABEL CANCELADA: los args '$ARGS' no estan en /proc/cmdline"
+            rm -f "$STATE"
+            die "los argumentos de kernel no llegaron a aplicarse; prueba cancelada"
+        fi
+    fi
+
+    if [ "$FORCE" != 1 ] && ! on_battery; then
+        logline "### PRUEBA $LABEL CANCELADA: el equipo esta enchufado"
+        rm -f "$STATE"
+        die "el equipo esta enchufado: la medida no valdria. Desenchufa y relanza."
+    fi
+
+    # Ventana de aborto
+    wall "s5-test: la prueba '$LABEL' apagara el equipo en $WAIT s.
+Para cancelar:  sudo s5-test abort" 2>/dev/null
+    notify_desktop "s5-test: prueba '$LABEL'" "El equipo se apagara en $WAIT s. Cancelar: sudo s5-test abort"
+    info "apagando en $WAIT s — 'sudo s5-test abort' para cancelar"
+    for ((i=WAIT; i>0; i--)); do
+        if [ -e "$ABORT_FLAG" ]; then
+            logline "### PRUEBA $LABEL abortada por el usuario"
+            rm -f "$STATE" "$ABORT_FLAG"
+            die "abortada por el usuario"
+        fi
+        sleep 1
+    done
+
+    # Comandos previos al apagado
+    PRE_OUT=""
+    if [ -n "$PRE" ]; then
+        PRE_OUT=$(bash -c "$PRE" 2>&1)
+        PRE_RC=$?
+        if [ $PRE_RC -ne 0 ]; then
+            logline "### PRUEBA $LABEL CANCELADA: los comandos previos fallaron (rc=$PRE_RC): $PRE_OUT"
+            rm -f "$STATE"
+            die "los comandos previos fallaron (rc=$PRE_RC): $PRE_OUT"
+        fi
+        sleep 5   # que el kernel asiente los cambios (p.ej. runtime PM tras un remove)
+    fi
+
+    # Diagnostico del estado de energia PCI justo antes de apagar
+    DIAG="/var/log/s5-test-$LABEL.pci"
+    # Dos pasadas a proposito: lspci lee el espacio de configuracion y eso
+    # despierta al dispositivo (y al leer un puente, a todo su subarbol), asi
+    # que falsearia los estados. Primero se captura todo por sysfs, y solo
+    # despues se ponen los nombres.
+    SNAP=()
+    for d in /sys/bus/pci/devices/*; do
+        SNAP+=("${d##*/} $(cat "$d/power_state" 2>/dev/null) $(cat "$d/power/runtime_status" 2>/dev/null)")
+    done
+    { echo "# $(date '+%F %T')  estado PCI antes del apagado — prueba $LABEL"
+      for s in "${SNAP[@]}"; do
+          read -r addr pstate rstate <<<"$s"
+          printf '%s  %-8s %-10s %s\n' "$addr" "$pstate" "$rstate" \
+              "$(lspci -s "$addr" 2>/dev/null | cut -d' ' -f2- | cut -c1-60)"
+      done; } > "$DIAG"
+
+    # Armar el despertador del RTC y apagar
+    WAKE_AT=$(( $(date +%s) + MINUTES*60 ))
+    echo 0 > /sys/class/rtc/rtc0/wakealarm
+    echo "$WAKE_AT" > /sys/class/rtc/rtc0/wakealarm || info "AVISO: no se pudo armar el RTC"
+    ARMED=$(cat /sys/class/rtc/rtc0/wakealarm 2>/dev/null)
+
+    mkdir -p "$STATE_DIR"
+    { echo "LABEL=$LABEL"; echo "MINUTES=$MINUTES"; echo "ARGS=$ARGS"
+      echo "PRE=$PRE"; echo "WAKE_AT=$WAKE_AT"; } > "$PENDING"
+    rm -f "$STATE"
+
+    logline "### PRUEBA '$LABEL' — apagando $(date '+%F %T')  bat $(bat_pct)% $(bat_wh) Wh"
+    [ -n "$ARGS" ] && logline "###   cmdline: $(tr -d '\0' < /proc/cmdline)"
+    [ -n "$PRE"  ] && logline "###   previo : $(echo "$PRE" | tr '\n' ';')  -> ${PRE_OUT:-ok}"
+    logline "###   despertar RTC programado a los $MINUTES min (wakealarm=$ARMED)"
+
+    sync
+    systemctl poweroff
+}
+
+# ---------------------------------------------------------------- fase 3
+cmd_report() {
+    need_root
+    # FIRMA TERMICA capturada LO ANTES POSIBLE tras el arranque — cuanto antes se
+    # lea, mas queda del calor del S5. Se captura ya, se vuelca al final junto al
+    # resultado. Vive aqui porque las pruebas de s5-test arrancan con systemd (en
+    # su dia hubo tambien un init minimo: la fila `minimal-init` de
+    # docs/EVIDENCE.md, del arnes que ese mismo documento explica que NO se
+    # publica). Ojo: por si sola NO discrimina limpio de envenenado (regla 10);
+    # se guarda como contexto, no como veredicto.
+    _p2=$(
+        for h in /sys/class/hwmon/hwmon*; do
+            _n=$(cat "$h/name" 2>/dev/null) || continue
+            for t in "$h"/temp*_input "$h"/power*_input "$h"/in*_input "$h"/curr*_input; do
+                [ -r "$t" ] || continue
+                echo "P2TEMP ${h##*/} $_n ${t##*/}=$(cat "$t" 2>/dev/null) $(cat "${t%_input}_label" 2>/dev/null)"
+            done
+        done
+        for z in /sys/class/thermal/thermal_zone*; do
+            [ -r "$z/temp" ] || continue
+            echo "P2TEMP ${z##*/} $(cat "$z/type" 2>/dev/null) $(cat "$z/temp" 2>/dev/null)"
+        done
+        for c in /sys/class/thermal/cooling_device*; do
+            [ -r "$c/cur_state" ] || continue
+            echo "P2FAN ${c##*/} $(cat "$c/type" 2>/dev/null) $(cat "$c/cur_state" 2>/dev/null)/$(cat "$c/max_state" 2>/dev/null)"
+        done
+    )
+    [ -r "$PENDING" ] || exit 0
+    # shellcheck disable=SC1090
+    . "$PENDING"
+    now=$(date +%s)
+    delta=$(( now - WAKE_AT ))
+    if [ "$delta" -ge -90 ] && [ "$delta" -le 180 ]; then
+        how="desperto solo por RTC (desvio ${delta}s)"
+    else
+        how="NO desperto por RTC (arranque manual, ${delta}s de desvio) — la ventana es mas larga de lo pedido"
+    fi
+    logline "###   fin de la prueba '$LABEL': $how"
+    logline "###   firma termica al despertar (uptime $(cut -d. -f1 /proc/uptime 2>/dev/null)s):"
+    printf '%s\n' "$_p2" | sed 's/^/###     /' >> "$LOG"
+    echo 0 > /sys/class/rtc/rtc0/wakealarm 2>/dev/null
+    rm -f "$PENDING"
+}
+
+# ---------------------------------------------------------------- fase 1
+cmd_arm() {
+    need_root
+    [ -n "$BAT" ] || die "no encuentro la bateria"
+    [ -e "$STATE" ] && die "ya hay una prueba armada (s5-test status / s5-test abort)"
+    [ -e "$PENDING" ] && die "hay una prueba a medias sin cerrar (s5-test status)"
+
+    [ "$MINUTES" -ge 5 ] && [ "$MINUTES" -le 180 ] || die "-m fuera de rango (5..180)"
+
+    # Presupuesto de bateria: ~20 W medidos en S5 + margen
+    need_wh=$(awk -v m="$MINUTES" 'BEGIN{printf "%.1f", m/60*20 + 8}')
+    have_wh=$(bat_wh)
+    if [ "$FORCE" != 1 ] && awk -v h="$have_wh" -v n="$need_wh" 'BEGIN{exit !(h < n)}'; then
+        die "bateria insuficiente: $have_wh Wh disponibles, hacen falta ~$need_wh Wh para $MINUTES min. Carga primero (o -f)."
+    fi
+    if [ "$FORCE" != 1 ] && ! on_battery; then
+        die "el equipo esta ENCHUFADO: desenchufalo antes de lanzar la prueba (o -f)."
+    fi
+
+    mkdir -p "$STATE_DIR"
+    { echo "LABEL='$LABEL'"; echo "MINUTES=$MINUTES"
+      printf 'ARGS=%q\n' "$ARGS"; printf 'PRE=%q\n' "$PRE"
+      echo "WAIT=$WAIT"; echo "FORCE=$FORCE"; } > "$STATE"
+
+    install_units
+
+    if [ -n "$ARGS" ]; then
+        # grubby parte los argumentos con espacios (p.ej. acpi_osi="!Windows 2020"),
+        # asi que se parchean las entradas BLS a mano, con copia de seguridad.
+        mkdir -p "$BLS_BAK"
+        cp -a "$BLS_DIR"/*.conf "$BLS_BAK"/ || die "no pude respaldar $BLS_DIR"
+        for f in "$BLS_DIR"/*.conf; do
+            sed -i "s|^options .*|& $ARGS|" "$f"
+        done
+        systemctl enable "$RUN_UNIT" >/dev/null || { restore_bls; die "no pude activar $RUN_UNIT"; }
+        info "prueba '$LABEL' armada: $MINUTES min, args '$ARGS'"
+        info "reiniciando para aplicar los argumentos; tras el arranque hay $WAIT s para abortar"
+        sleep 3
+        systemctl reboot
+    else
+        # Sin argumentos de kernel no hace falta reiniciar: se va directo a la fase 2
+        info "prueba '$LABEL' armada: $MINUTES min, sin reinicio previo"
+        info "hay $WAIT s para abortar con 'sudo s5-test abort'"
+        systemctl reset-failed s5-test-phase2 >/dev/null 2>&1
+        systemd-run --unit=s5-test-phase2 --description='s5-test fase 2' \
+            /usr/local/bin/s5-test --phase2 >/dev/null
+    fi
+}
+
+install_units() {
+    cat > /etc/systemd/system/$RUN_UNIT <<EOF
+[Unit]
+Description=s5-test: ejecuta la fase 2 de la prueba de consumo en S5
+After=multi-user.target
+ConditionPathExists=$STATE
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/s5-test --phase2
+StandardOutput=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    # ESTA UNIDAD ESTA VERSIONADA en tools/s5-test-report.service, porque
+    # `s5-grub-halt` tambien la necesita y no pasa por aqui: la instala
+    # `install.sh --tools`. Aqui solo se escribe SI NO ESTA, para no pisar en
+    # silencio lo que instalo el repo — que es la fuente de la verdad. Este
+    # heredoc es la red para quien use la herramienta sin haber instalado nada.
+    if [ ! -e /etc/systemd/system/s5-test-report.service ]; then
+        cat > /etc/systemd/system/s5-test-report.service <<EOF
+[Unit]
+Description=s5-test: anota el resultado de la prueba tras despertar del S5
+After=s5-energy-log.service
+Requires=s5-energy-log.service
+ConditionPathExists=$PENDING
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/s5-test --report
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    fi
+    systemctl daemon-reload
+    systemctl enable s5-test-report.service >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------- argumentos
+MINUTES=35; ARGS=""; PRE=""; WAIT=90; FORCE=0; LABEL=""
+
+case "${1:-}" in
+    abort)     cmd_abort;  exit 0 ;;
+    status)    cmd_status; exit 0 ;;
+    --phase2)  cmd_phase2; exit 0 ;;
+    --report)  cmd_report; exit 0 ;;
+esac
+
+while getopts ":m:a:p:w:fh" opt; do
+    case "$opt" in
+        m) MINUTES=$OPTARG ;;
+        a) ARGS=$OPTARG ;;
+        p) PRE=$OPTARG ;;
+        w) WAIT=$OPTARG ;;
+        f) FORCE=1 ;;
+        h) awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
+        :) die "falta el valor de -$OPTARG" ;;
+        *) die "opcion desconocida -$OPTARG" ;;
+    esac
+done
+shift $((OPTIND-1))
+LABEL="${1:-}"
+[ -n "$LABEL" ] || die "falta la ETIQUETA de la prueba (s5-test -h)"
+case "$LABEL" in *[!A-Za-z0-9._-]*) die "la etiqueta solo admite letras, numeros, . _ -";; esac
+
+cmd_arm

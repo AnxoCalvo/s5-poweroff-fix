@@ -1,0 +1,211 @@
+#!/bin/bash
+# s5-queue — encadena pruebas de consumo en S5 sin intervencion humana.
+#
+# El cuello de botella de esta investigacion no es pensar: es que cada medida
+# obliga a apagar el equipo y volver a encenderlo, y eso NO se puede paralelizar
+# (hay un solo portatil y solo puede estar en un estado de apagado a la vez).
+# Lo que si se puede es quitar al humano del bucle: se deja una cola de pruebas,
+# se desenchufa una vez, y el equipo las va ejecutando solo, una tras otra,
+# anotando cada resultado en /var/log/s5-energy.log.
+#
+# Uso:
+#   s5-queue add '<lanzador> <args...>'   encola una prueba
+#   s5-queue list                          que hay en la cola
+#   s5-queue stop                          vacia la cola y aborta lo armado
+#   s5-queue next                          (interno: lo llama la unidad systemd)
+#
+# Ejemplo:
+#   s5-queue add 's5-test -m 20 -a "rd.driver.blacklist=amdgpu" sin-amdgpu'
+#   s5-queue add 's5-grub-halt -m 20'
+#
+# La cadena se DETIENE SOLA cuando:
+#   - una prueba mide por debajo de UMBRAL_W (5 W): eso es un EXITO, hay que
+#     mirarlo antes de seguir gastando bateria y arranques;
+#   - la bateria baja de MIN_WH;
+#   - se superan MAX arranques encadenados (cortafuegos contra bucles);
+#   - la cola se vacia.
+#
+# Si una prueba logra un S5 de verdad, el RTC no despertara al equipo y la
+# cadena se queda esperando a que lo enciendas a mano: eso ES el resultado.
+
+set -u
+
+STATE_DIR=/var/lib/s5-test
+QUEUE="$STATE_DIR/queue"
+COUNT="$STATE_DIR/queue-count"
+PENDING="$STATE_DIR/pending"
+STATE="$STATE_DIR/state"
+LOG=/var/log/s5-energy.log
+UNIT=s5-queue-next.service
+# LA CONFIGURACION. Este era el unico fichero que lee S5_BAT y no la sourceaba
+# por ningun camino, ni directo ni de rebote por un descubridor: quien pusiera
+# S5_BAT= en la conf tenia una cola midiendo la bateria equivocada para decidir
+# si quedaba margen, mientras s5-test y s5-energy-log obedecian. En un portatil de
+# dos celdas eso es una tanda que se planta —o que sigue— por la celda que no es.
+S5_CONF=${S5_CONF:-/etc/s5-poweroff-fix.conf}
+# shellcheck source=/dev/null
+[ -r "$S5_CONF" ] && . "$S5_CONF"
+
+# Umbral de exito. Con ventanas cortas (-m 5) la energia del apagado y del POST
+# —unos 0,35 Wh— se le carga al S5 y sesga la medida hacia arriba: un S5 real de
+# 1 W sale como ~5 W, y uno falso de 20 W sale como ~24 W. La separacion sigue
+# siendo abismal, pero el corte no puede estar en 5.
+UMBRAL_W=8      # por debajo de esto la prueba es un exito => parar y mirar
+# Override para tandas de BISECCION, donde varias pruebas van a dar S5 real a
+# proposito y la cola NO debe pararse: echo 0 > /var/lib/s5-test/queue-umbral
+# (0 = no parar nunca por vatios). Borrar el fichero para volver al umbral 8.
+if [ -r "$STATE_DIR/queue-umbral" ]; then
+    _u=$(cat "$STATE_DIR/queue-umbral" 2>/dev/null)
+    case "$_u" in [0-9]|[0-9].[0-9]|[0-9][0-9]) UMBRAL_W=$_u ;; esac
+fi
+MIN_WH=12       # margen de bateria para no quedarse tirado
+MAX=12          # arranques encadenados como mucho
+
+die()     { echo "s5-queue: $*" >&2; exit 1; }
+info()    { echo "s5-queue: $*"; }
+logline() { printf '%s\n' "$*" >> "$LOG"; }
+
+need_root() { [ "$(id -u)" = 0 ] || die "hay que ejecutarlo como root (sudo)"; }
+
+bat_wh() {
+    local b; b="${S5_BAT:-$(ls -d /sys/class/power_supply/BAT* 2>/dev/null | head -1)}"
+    [ -n "$b" ] && awk '{printf "%.1f", $1/1000000}' "$b/energy_now" 2>/dev/null
+}
+
+# Vatios de la ultima medida cerrada, tal como los escribe s5-energy-log.
+ultimo_w() {
+    grep -oE '= +[0-9]+[.,][0-9]+ W medios en S5' "$LOG" 2>/dev/null |
+        tail -1 | grep -oE '[0-9]+[.,][0-9]+' | tr ',' '.'
+}
+
+instalar_unidad() {
+    # ESTA UNIDAD ESTA VERSIONADA en tools/s5-queue-next.service y la instala
+    # `install.sh --tools`. Aqui solo se escribe SI NO ESTA: dos fuentes de la
+    # misma unidad, y la del repo es la buena. Sin esta guarda, editar el fichero
+    # versionado no servia de nada — el primer `s5-queue add` lo pisaba.
+    if [ ! -e /etc/systemd/system/$UNIT ]; then
+    cat > /etc/systemd/system/$UNIT <<EOF
+[Unit]
+Description=s5-queue: lanza la siguiente prueba de consumo en S5 de la cola
+After=s5-test-report.service s5-energy-log.service multi-user.target
+ConditionPathExists=$QUEUE
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/s5-queue next
+TimeoutStartSec=1200
+StandardOutput=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    fi
+    systemctl daemon-reload
+    systemctl enable "$UNIT" >/dev/null 2>&1
+}
+
+cmd_add() {
+    need_root
+    local linea="${1:-}"
+    [ -n "$linea" ] || die "falta la orden a encolar"
+    case "$linea" in
+        s5-test\ *|s5-grub-halt\ *) ;;
+        *) die "solo se admiten ordenes 's5-test ...' o 's5-grub-halt ...'" ;;
+    esac
+    mkdir -p "$STATE_DIR"
+    printf '%s\n' "$linea" >> "$QUEUE"
+    instalar_unidad
+    info "encolada: $linea  ($(wc -l < "$QUEUE") en la cola)"
+}
+
+cmd_list() {
+    [ -s "$QUEUE" ] || { echo "s5-queue: la cola esta vacia"; exit 0; }
+    echo "s5-queue: pendientes ($(wc -l < "$QUEUE")), bateria $(bat_wh) Wh, arranques encadenados $(cat "$COUNT" 2>/dev/null || echo 0)/$MAX"
+    nl -ba "$QUEUE"
+}
+
+cmd_stop() {
+    need_root
+    rm -f "$QUEUE" "$COUNT"
+    systemctl disable "$UNIT" >/dev/null 2>&1
+    /usr/local/bin/s5-test abort >/dev/null 2>&1
+    logline "### COLA DETENIDA a mano ($(date '+%F %T'))"
+    info "cola vaciada y prueba armada (si habia) abortada"
+}
+
+cmd_next() {
+    need_root
+    [ -s "$QUEUE" ] || { rm -f "$QUEUE" "$COUNT"; exit 0; }
+
+    # Una prueba a medias o ya armada: no encadenar encima.
+    if [ -e "$PENDING" ] || [ -e "$STATE" ]; then
+        info "hay una prueba en curso; no lanzo la siguiente"
+        exit 0
+    fi
+
+    # Exito: la ultima medida bajo del umbral => parar y avisar.
+    local w; w=$(ultimo_w)
+    if [ -n "$w" ] && awk -v w="$w" -v u="$UMBRAL_W" 'BEGIN{exit !(w < u)}'; then
+        logline "### COLA DETENIDA: la ultima prueba midio $w W (< $UMBRAL_W W) => EXITO."
+        logline "###   Quedaban $(wc -l < "$QUEUE") pruebas sin lanzar; no se tiran mas arranques"
+        logline "###   hasta confirmar el hallazgo con una medida larga (-m 20)."
+        rm -f "$QUEUE" "$COUNT"
+        systemctl disable "$UNIT" >/dev/null 2>&1
+        info "EXITO: ultima medida $w W. Cola detenida."
+        exit 0
+    fi
+
+    # Bateria.
+    local wh; wh=$(bat_wh)
+    if [ -n "$wh" ] && awk -v h="$wh" -v m="$MIN_WH" 'BEGIN{exit !(h < m)}'; then
+        logline "### COLA EN PAUSA: bateria $wh Wh (< $MIN_WH Wh). Carga y relanza con 's5-queue next'."
+        info "bateria insuficiente ($wh Wh); cola en pausa"
+        exit 0
+    fi
+
+    # Cortafuegos contra bucles de apagado.
+    local n; n=$(cat "$COUNT" 2>/dev/null || echo 0)
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    if [ "$n" -ge "$MAX" ]; then
+        logline "### COLA DETENIDA: $n arranques encadenados, tope de seguridad ($MAX)"
+        rm -f "$QUEUE" "$COUNT"
+        systemctl disable "$UNIT" >/dev/null 2>&1
+        exit 0
+    fi
+    echo $((n + 1)) > "$COUNT"
+
+    # Sacar la primera de la cola (y quitarla YA: si la prueba se cuelga, no se
+    # repite sola en el arranque siguiente).
+    local linea rest
+    linea=$(head -1 "$QUEUE")
+    rest=$(tail -n +2 "$QUEUE")
+    if [ -n "$rest" ]; then printf '%s\n' "$rest" > "$QUEUE"; else rm -f "$QUEUE"; fi
+
+    local lanzador args
+    lanzador=${linea%% *}
+    args=${linea#* }
+    case "$lanzador" in
+        s5-test|s5-grub-halt) ;;
+        *) logline "### COLA: orden no admitida '$linea', descartada"; exit 0 ;;
+    esac
+
+    logline "### COLA ($((n + 1))/$MAX): lanzando '$linea'  — bateria $wh Wh, quedan $( [ -e "$QUEUE" ] && wc -l < "$QUEUE" || echo 0 ) despues de esta"
+    info "lanzando: $linea"
+
+    # Los argumentos se parten respetando las comillas (asi valen los valores con
+    # espacios, p.ej. -a 'rd.driver.blacklist=x modprobe.blacklist=x'). La linea
+    # solo la puede escribir root y el lanzador ya esta validado arriba.
+    eval "set -- $args" || { logline "### COLA: no pude interpretar '$linea'"; exit 0; }
+
+    # Si esta enchufado, espera a que se desenchufe (hasta 15 min); si ya lo
+    # esta, arranca en 3 s.
+    exec /usr/local/bin/s5-test-on-unplug -c "/usr/local/bin/$lanzador" "$@"
+}
+
+case "${1:-}" in
+    add)  shift; cmd_add "${1:-}" ;;
+    list) cmd_list ;;
+    stop) cmd_stop ;;
+    next) cmd_next ;;
+    *)    sed -n '2,30p' "$0"; exit 0 ;;
+esac

@@ -1,0 +1,126 @@
+#!/bin/bash
+# /usr/local/bin/s5-gpu-en-uso-arm
+#
+# PREVIO de la prueba `gpu-en-uso-v1` (2026-08-10): mide un apagado con la dGPU
+# DESPIERTA, que es la unica rama de la mitigacion que nunca se ha medido.
+#
+# QUE PREGUNTA RESUELVE
+# Las 4 medidas limpias (1,77 / 2,04 / 2,00 / 2,09 W) se hicieron con la dGPU
+# ociosa, que cae sola a D3cold en ~20 s. En uso real —monitor externo por HDMI,
+# PRIME, CUDA— puede NO bajar; entonces el hook 99y la blinda DESPIERTA y el S5
+# deberia volver a costar 18-20 W. El hook ya lo avisa desde las 22:17, pero es
+# una rama ENSAYADA, NO MEDIDA.
+#
+# COMO AISLA (una sola variable frente a una medida que ya existe)
+#   gpu-d0-pm1a-control-v3 (18:15-18:36): dGPU en D0, apagado por PM1a_CNT
+#                                         saltandose device_shutdown() => 19,85 W
+#   ESTA:                                 dGPU en D0, apagado NORMAL de systemd
+#                                         con el blindaje pmrt puesto      => ?
+# Lo unico que cambia es el camino de apagado. Por eso se clava la dGPU en D0
+# con `power/control=on` —el mismo metodo del control v3— y NO se monta ninguna
+# carga de GPU: una carga real se muere al apagar y metería una variable de
+# tiempo justo en los 20 s que decide el hook. Lo que importa no es que la GPU
+# calcule, sino EL D-STATE CON EL QUE LLEGA AL S5.
+#
+# LECTURA FIJADA DE ANTEMANO
+#   ~18-20 W + `PMRT TESTIGO ... dGPU=D0` + `!!! AVISO`  => el agujero es REAL y
+#       queda MEDIDO: con la dGPU despierta la mitigacion no protege. Toca
+#       decidir politica (esperar mas, o caer a grub-halt).
+#   ~2 W  => mirar EL TESTIGO ANTES DE CELEBRAR: si dice `dGPU=D0`, el blindaje
+#       en D0 bastaria y habria que explicar por que; si dice `D3cold`, la
+#       prueba es NULA (algo la durmio) y hay que buscar quien.
+#   CUELGUE (falta el `APAGADO` intermedio en s5-energy.log, regla 4) => blindar
+#       una GPU despierta cuelga el apagado: peor que el gasto.
+#
+# Sale con rc!=0 si algo no cuadra, y entonces `s5-test` CANCELA la prueba en vez
+# de gastar la ventana de 20 min.
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+CONTROL_D0=/var/lib/s5-test/gpu-d0-control
+DISABLE=/var/lib/s5-test/gpu-pmrt-disabled
+PM1AFLAG=/var/lib/s5-test/gpu-pm1a-armed
+PM1AHOOK=/usr/lib/systemd/system-shutdown/99z-s5-gpu-pm1a.shutdown
+HOOK_PCI=/usr/lib/systemd/system-shutdown/99-s5-pci-state.shutdown
+HOOK_PMRT=/usr/lib/systemd/system-shutdown/99y-s5-gpu-pmrt.shutdown
+HOOKDIR=/usr/lib/systemd/system-shutdown
+ELOG="${S5_ARM_ELOG:-/var/log/s5-energy.log}"   # se desvia para ensayar en seco
+# QUE dispositivos. Antes estaban clavados aqui, o sea los de la maquina donde se
+# diagnostico esto; en cualquier otra ese BDF puede ser el NVMe. Salen de sysfs.
+DESCUBRE=${S5_DESCUBRE:-/usr/local/bin/s5-descubre-dgpu}
+GPU=''; AUDIO=''; BRIDGE=''
+# shellcheck source=/dev/null
+[ -r "$DESCUBRE" ] && . "$DESCUBRE"
+[ -n "$GPU" ] || { echo "$(basename "$0"): no encuentro la dGPU (falta $DESCUBRE, o esta maquina no lleva discreta del vendor buscado)" >&2; exit 1; }
+
+rd() { local v=''; [ -r "$1" ] || { printf '?'; return; }; read -r v < "$1" 2>/dev/null; printf '%s' "${v:-?}"; }
+estado() {   # SOLO sysfs (regla 20): lspci/nvidia-smi/proc-asound DESPIERTAN el subarbol
+    printf 'dGPU=%s/%s audio=%s/%s puente=%s/%s' \
+        "$(rd /sys/bus/pci/devices/$GPU/power_state)"    "$(rd /sys/bus/pci/devices/$GPU/power/runtime_status)" \
+        "$(rd /sys/bus/pci/devices/$AUDIO/power_state)"  "$(rd /sys/bus/pci/devices/$AUDIO/power/runtime_status)" \
+        "$(rd /sys/bus/pci/devices/$BRIDGE/power_state)" "$(rd /sys/bus/pci/devices/$BRIDGE/power/runtime_status)"
+}
+no() { echo "NO ARMADO: $*"; exit 1; }
+
+rm -f "$CONTROL_D0"
+
+# --- 1. LA GUARDA DEL HOOK 99 ----------------------------------------------
+# Sin ella ese hook escribe `auto` en power/control y espera a D3cold, o sea que
+# duerme la dGPU y la medida repite una limpia cualquiera en vez de controlarla.
+# Es lo que tumbo el primer control D0 el 2026-08-10 a las 17:00.
+grep -q 'CONTROL_D0' "$HOOK_PCI" 2>/dev/null || no "$HOOK_PCI no tiene la guarda CONTROL_D0; dormiria la dGPU y la prueba no mediria nada"
+
+# --- 2. EL DIRECTORIO DE HOOKS, ENTERO (regla 17) --------------------------
+# Lo que tumbo el control v2 a las 17:41 no fue otro hook: fue una COPIA del
+# mismo hook que se quedo dentro del directorio con permiso de ejecucion.
+CULPABLES=''; COPIAS=''
+while IFS= read -r h; do
+    [ -n "$h" ] || continue
+    case "${h##*/}" in
+        *.bak*|*.orig|*.rpmsave|*.rpmnew|*~|*.old|*.pre-*|*.copia*) COPIAS="$COPIAS ${h##*/}" ;;
+    esac
+    grep -q 'power/control' "$h" 2>/dev/null || continue
+    grep -q 'CONTROL_D0'    "$h" 2>/dev/null || CULPABLES="$CULPABLES ${h##*/}"
+done <<EOF
+$(find "$HOOKDIR" -maxdepth 1 -type f -perm -u+x 2>/dev/null | sort)
+EOF
+[ -z "$CULPABLES" ] || no "escriben en power/control SIN la guarda:$CULPABLES (systemd corre los hooks EN PARALELO)"
+[ -z "$COPIAS"    ] || no "copias ejecutables en el directorio de hooks:$COPIAS (regla 17: van fuera)"
+
+# --- 3. LA MITIGACION TIENE QUE ESTAR ACTIVA -------------------------------
+# El objeto de la prueba es el apagado MITIGADO con la dGPU despierta. Si el
+# freno esta puesto, o el 99y no esta, se estaria midiendo otra cosa.
+[ -x "$HOOK_PMRT" ] || no "no esta el hook $HOOK_PMRT: esta prueba mide el apagado MITIGADO"
+[ -e "$DISABLE" ]   && no "el freno de mano esta puesto ($DISABLE): se mediria un apagado SIN mitigar"
+[ -e "$PM1AFLAG" ] && [ -x "$PM1AHOOK" ] && no "el arnes de PM1a esta reinstalado y armado: el 99y abortaria"
+
+# --- 4. EL MODULO, PARA EL KERNEL VIVO (regla 11) --------------------------
+vm="$(modinfo -k "$(uname -r)" -F vermagic s5_pmrt_arm 2>/dev/null | awk '{print $1}')"
+[ "$vm" = "$(uname -r)" ] || no "no hay modulo s5_pmrt_arm para $(uname -r) (vermagic='$vm'); el blindaje no se aplicaria y la medida no seria la que se busca"
+
+# --- 5. ARMAR: guarda + dGPU CLAVADA EN D0 ---------------------------------
+antes="$(estado)"
+: > "$CONTROL_D0"
+for d in "$BRIDGE" "$GPU" "$AUDIO"; do
+    echo on > "/sys/bus/pci/devices/$d/power/control" 2>/dev/null
+done
+sleep 3
+despues="$(estado)"
+
+# --- 6. VERIFICAR QUE DE VERDAD ESTA DESPIERTA -----------------------------
+# Si no lo esta, cancelar: una prueba que no reproduce el escenario es una
+# ventana de 20 min tirada y, peor, una medida limpia que se leeria como exito.
+[ "$(rd /sys/bus/pci/devices/$GPU/power_state)" = D0 ] || {
+    for d in "$BRIDGE" "$GPU" "$AUDIO"; do echo auto > "/sys/bus/pci/devices/$d/power/control" 2>/dev/null; done
+    rm -f "$CONTROL_D0"
+    no "la dGPU NO se ha quedado en D0 tras 'power/control=on' ($despues)"
+}
+
+{
+    printf '###   gpu-en-uso: guarda %s puesta; dGPU+puente+audio clavados con power/control=on\n' "$CONTROL_D0"
+    printf '###   gpu-en-uso: estado ANTES   %s\n' "$antes"
+    printf '###   gpu-en-uso: estado DESPUES %s   <- debe decir dGPU=D0\n' "$despues"
+    printf '###   gpu-en-uso: LECTURA ~18-20 W => el agujero es real; ~2 W => mirar el testigo del 99y ANTES de celebrar\n'
+} >> "$ELOG" 2>/dev/null
+
+echo "ARMADO: $despues"
+exit 0

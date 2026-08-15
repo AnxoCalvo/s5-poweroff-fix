@@ -1,0 +1,93 @@
+#!/bin/bash
+# s5-descubre-grub — localiza el sabor de GRUB de esta maquina.
+#
+# Se USA CON `.` (source), no se ejecuta: deja puestas
+#
+#     GRUB_DIR      /boot/grub2  o  /boot/grub
+#     GRUB_CUSTOM   $GRUB_DIR/custom.cfg
+#     GRUB_REBOOT   grub2-reboot  o  grub-reboot
+#     GRUB_EDITENV  grub2-editenv o  grub-editenv
+#
+# y vacio lo que no encuentre, para que quien llama decida (todos los que lo
+# usan fallan seguro: se registra y el apagado sigue su curso normal).
+#
+# POR QUE EXISTE. Fedora, RHEL y SUSE llaman a esto `grub2-*` y montan el
+# directorio en /boot/grub2. Debian, Ubuntu y Arch usan `grub-*` y /boot/grub.
+# Con los nombres de Fedora clavados, la rama de GRUB de la politica —el
+# salvavidas del caso raro— no funcionaba en media distribucion; no rompia nada,
+# porque aborta y deja seguir el apagado, pero tampoco ahorraba.
+#
+# Se detecta cada cosa POR SEPARADO y no se deduce una de otra: hay instalaciones
+# mixtas (un /boot/grub que es enlace a /boot/grub2, o al reves) y suponer que
+# quien tiene `grub2-reboot` tiene /boot/grub2 es justo la clase de suposicion
+# que este proyecto lleva todo el dia quitando.
+#
+# ESCAPE MANUAL en /etc/s5-poweroff-fix.conf: S5_GRUB_DIR, S5_GRUB_REBOOT y
+# S5_GRUB_EDITENV. Lo que se fije ahi gana y ni se busca.
+#
+#   s5-descubre-grub          ejecutado a pelo, imprime lo que encuentra
+#
+# S5_GRUB_DIRS existe SOLO para ensayar (regla 22): permite apuntar la busqueda a
+# directorios de mentira y provocar las ramas sin tocar el /boot de verdad.
+
+S5_CONF=${S5_CONF:-/etc/s5-poweroff-fix.conf}
+# shellcheck source=/dev/null
+[ -r "$S5_CONF" ] && . "$S5_CONF"
+
+GRUB_DIR="${S5_GRUB_DIR:-}"
+GRUB_REBOOT="${S5_GRUB_REBOOT:-}"
+GRUB_EDITENV="${S5_GRUB_EDITENV:-}"
+
+# El directorio: se exige que contenga `grubenv`, no que exista a secas. Un
+# /boot/grub vacio lo deja cualquier instalador a medias, y escribir el
+# custom.cfg ahi no serviria de nada — GRUB no lo leeria.
+#
+# OJO AL FALSO NEGATIVO: /boot/grub2 suele ser drwx------ root, asi que sin root
+# el `-e` de dentro da falso y esto parece "no hay GRUB". Todos los que usan
+# esto corren como root, pero alguien depurando a mano no, y merece que se le
+# diga la verdad en vez de mandarlo a buscar un problema que no tiene.
+GRUB_SIN_PERMISO=''
+if [ -z "$GRUB_DIR" ]; then
+    for d in ${S5_GRUB_DIRS:-/boot/grub2 /boot/grub}; do
+        [ -d "$d" ] || continue
+        if [ -e "$d/grubenv" ]; then GRUB_DIR="$d"; break; fi
+        [ -r "$d" ] || GRUB_SIN_PERMISO="${GRUB_SIN_PERMISO:-$d}"
+    done
+fi
+
+# Los comandos: por PATH, cada uno por su cuenta.
+if [ -z "$GRUB_REBOOT" ]; then
+    for c in grub2-reboot grub-reboot; do
+        command -v "$c" >/dev/null 2>&1 && { GRUB_REBOOT="$c"; break; }
+    done
+fi
+if [ -z "$GRUB_EDITENV" ]; then
+    for c in grub2-editenv grub-editenv; do
+        command -v "$c" >/dev/null 2>&1 && { GRUB_EDITENV="$c"; break; }
+    done
+fi
+
+GRUB_CUSTOM=''
+[ -n "$GRUB_DIR" ] && GRUB_CUSTOM="$GRUB_DIR/custom.cfg"
+
+# Ejecutado a pelo (no sourced): informe legible. `return` falla en un script
+# ejecutado, y ese fallo es justo lo que distingue los dos casos.
+(return 0 2>/dev/null) || {
+    printf 'directorio : %s\n' "${GRUB_DIR:-(no encontrado)}"
+    printf 'custom.cfg : %s\n' "${GRUB_CUSTOM:-(sin directorio)}"
+    printf 'reboot     : %s\n' "${GRUB_REBOOT:-(no encontrado)}"
+    printf 'editenv    : %s\n' "${GRUB_EDITENV:-(no encontrado)}"
+    printf 'config     : %s\n' "$([ -r "$S5_CONF" ] && echo "$S5_CONF" || echo '(ninguna, todo descubierto)')"
+    if [ -z "$GRUB_DIR" ] && [ -n "$GRUB_SIN_PERMISO" ]; then
+        echo
+        printf 'OJO: %s existe pero no se puede leer sin root (suele ser drwx------).\n' "$GRUB_SIN_PERMISO"
+        echo 'Vuelve a lanzarlo con sudo antes de concluir que falta nada.'
+        exit 1
+    fi
+    if [ -z "$GRUB_DIR" ] || [ -z "$GRUB_REBOOT" ] || [ -z "$GRUB_EDITENV" ]; then
+        echo
+        echo 'Falta algo: la rama de GRUB de la politica se autodesactiva (falla segura'
+        echo 'y el apagado sigue normal). El resto del arreglo NO depende de esto.'
+        exit 1
+    fi
+}

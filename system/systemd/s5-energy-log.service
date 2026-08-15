@@ -1,0 +1,21 @@
+[Unit]
+Description=Mide el consumo de bateria con el equipo apagado (S5)
+Documentation=man:systemd.service(5)
+# Sin dependencias por defecto para poder ordenarnos a mano respecto al apagado.
+DefaultDependencies=no
+# Necesitamos /var montado para escribir el log, tanto al arrancar como al apagar
+# (al parar, el orden se invierte: nos ejecutamos ANTES de desmontar).
+Requires=local-fs.target
+After=local-fs.target
+# Que el ExecStop corra durante el apagado, justo antes de que se apague de verdad.
+Before=shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/s5-energy-log boot
+ExecStop=/usr/local/bin/s5-energy-log shutdown
+
+[Install]
+WantedBy=multi-user.target

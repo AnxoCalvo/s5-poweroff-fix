@@ -1,0 +1,119 @@
+[Unit]
+Description=Politica S5: evita el apagado caro si la dGPU sigue despierta
+Documentation=file:///var/log/s5-shutdown-pci.log
+
+# ---------------------------------------------------------------------------
+# LA VENTANA. Corregida el 2026-08-11 DESPUES del primer disparo real, que
+# salio mal por partida doble. Lo de antes era:
+#
+#     After=final.target
+#     Before=poweroff.target
+#
+# y las dos lineas estaban mal, cada una por su motivo, las dos verificadas
+# contra el grafo resuelto de systemd (no deducidas):
+#
+#  (1) `final.target` es `After=shutdown.target umount.target`. O sea que
+#      colgarse de el es colgarse DESPUES de desmontar. En el disparo del
+#      2026-08-11 00:57:45 el testigo de montajes salio `root=rw boot=` —
+#      vacio, ni `rw` ni `ro`: /boot no es que estuviera en solo lectura, es
+#      que YA NO ESTABA MONTADO. La rama de GRUB habria abortado siempre.
+#
+#  (2) `poweroff.target` es `After=systemd-poweroff.service`, asi que
+#      `Before=poweroff.target` NO nos ordena antes del apagado de verdad:
+#      dejaba esta unidad y `systemd-poweroff.service` como HERMANAS, las dos
+#      solo `After=final.target` y sin orden entre ellas. Arrancaron en el
+#      mismo segundo y `systemd-poweroff.service` (`SuccessAction=poweroff-force`)
+#      corto el script a mitad de la espera: el log tiene el "esperando hasta
+#      90s" y ni una linea mas.
+#
+# La ventana buena es la de aqui abajo, y cumple las DOS cosas que la
+# ordenacion SI puede dar (la tercera, /boot montado, no la puede dar nadie:
+# ver mas abajo):
+#
+#   After=shutdown.target   ya estan paradas todas las unidades que pueden
+#                           despertar la dGPU (gdm, user@1000, session-N.scope,
+#                           nvidia-powerd, switcheroo-control, alsa-state:
+#                           salen todas en el `After=` de shutdown.target),
+#                           asi que el juicio sobre su estado es representativo.
+#
+#   Before=umount.target    systemd nos ESPERA antes de cortar la corriente,
+#                           porque `systemd-poweroff.service` es
+#                           `Requires=/After=umount.target`. Esto resuelve (2)
+#                           y quedo CONFIRMADO en el apagado real del
+#                           2026-08-11 01:53:56: la unidad arranco a las
+#                           01:53:56.647, decidio a las 01:54:11.487 y solo
+#                           entonces se alcanzaron umount.target, final.target
+#                           y poweroff.target. Nos espero 14,8 s.
+#
+# LO QUE ESTA VENTANA *NO* DA, Y NINGUNA PUEDE DAR: /boot montado.
+#
+# En ese mismo apagado el testigo canto `boot=DESMONTADO`. No es que lleguemos
+# tarde: es que las UNIDADES DE MONTAJE mueren ANTES de que se alcance
+# shutdown.target. Del journal, mismo apagado:
+#
+#     01:53:56.490  Unmounting boot-efi.mount
+#     01:53:56.546  Unmounted boot.mount            <- /boot ya no esta
+#     01:53:56.645  Reached target shutdown.target  <- 100 ms DESPUES
+#
+# `umount.target` no es "cuando se desmonta todo": es un punto de
+# sincronizacion que se alcanza AL FINAL. Asi que CUALQUIER ventana
+# `After=shutdown.target` tiene /boot desmontado, siempre.
+#
+# Y ordenarse contra boot.mount no arregla nada. systemd.unit(5), literal:
+#     "Given two units with any ordering dependency between them, if one unit
+#      is shut down and the other is started up, the shutdown is ordered before
+#      the start-up. It does not matter if the ordering dependency is After= or
+#      Before=, in this case."
+# Nosotros nos ARRANCAMOS mientras boot.mount se PARA => el desmontaje va
+# primero pongamos `After=boot.mount` o `Before=boot.mount`. Y
+# `RequiresMountsFor=/boot` es lo mismo (implica After=) mas un Requires= sobre
+# una unidad con un job de stop en la misma transaccion: peor.
+#
+# SOLUCION (2026-08-11): la rama de GRUB de s5-gpu-politica MONTA /boot ella
+# misma con `mount /boot` —a secas, cogiendo la entrada de /etc/fstab— y lo
+# desmonta al terminar, solo si lo monto ella. Solo en esa rama, que es la rara.
+# NO hay respaldo con la UUID escrita a mano: lo hubo y se retiro el mismo dia,
+# porque salia de ese mismo fstab (o sea que como respaldo era circular) y porque
+# montar una UUID ajena en /boot para escribirle un custom.cfg es de las pocas
+# cosas de este proyecto que pueden romperle el arranque a otro. Si `mount /boot`
+# falla, se aborta y el apagado sigue normal. Razonamiento entero en la cabecera
+# de s5-gpu-politica.
+#
+# QUE ESTA ENSAYADO Y QUE NO, a 2026-08-15: las cinco ramas de `abortar()`, las
+# tres de `asegurar_boot()`, la rama armada de verdad (custom.cfg + next_entry
+# reales) y el fallback `reboot -f` corren en tests/ensayo-ramas.sh contra
+# shims. En apagado REAL solo se ha ejercitado el camino con exito de punta a
+# punta (`politica-grub-real-v1`, 2026-08-14, con la dGPU clavada en D0 a mano):
+# ahi el montaje en frio de /boot ocurrio de verdad. Ninguna rama de fallo se ha
+# disparado nunca en produccion.
+#
+# `Before=final.target systemd-poweroff.service` es redundante (umount.target
+# ya va antes de las dos) pero se deja escrito: es la parte que importa y no
+# quiero que dependa de una transitividad que nadie ve.
+#
+# No hay ciclo de orden: el unico camino de vuelta seria umount.target -> ... ->
+# shutdown.target, y umount.target solo va `Before` de final.target y de los
+# cuatro systemd-{poweroff,reboot,halt,kexec}.service, que a su vez van DESPUES
+# de shutdown.target, no antes.
+#
+# Se sigue colgando de poweroff.target y solo de ahi: en un `reboot` no se
+# activa, que es lo deseado.
+# ---------------------------------------------------------------------------
+DefaultDependencies=no
+After=shutdown.target
+Before=umount.target final.target systemd-poweroff.service
+
+# Freno de mano, igual que el del hook 99y
+ConditionPathExists=!/var/lib/s5-test/gpu-politica-disabled
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/s5-gpu-politica
+# Ultima red: si el script se atascara, systemd lo mata y sigue apagando.
+# Tiene que ser holgadamente mayor que el MAXWAIT de 90 s del script.
+TimeoutStartSec=150
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=poweroff.target

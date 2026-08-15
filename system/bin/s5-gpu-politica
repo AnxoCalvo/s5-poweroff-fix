@@ -1,0 +1,358 @@
+#!/bin/bash
+# s5-gpu-politica — decide, JUSTO ANTES de apagar, si el S5 va a salir caro.
+#
+# POR QUE EXISTE. La mitigacion permanente (hook 99y-s5-gpu-pmrt + akmod
+# s5-pmrt-arm) deja el S5 en ~2 W, pero SOLO si la dGPU llega dormida. Medido
+# el 2026-08-10 (fila 'gpu-en-uso-v1' de docs/EVIDENCE.md): si llega despierta, el S5
+# cuesta 19,38 W y el hook no puede hacer nada — blindar una GPU en D0 la
+# congela DESPIERTA.
+#
+# POLITICA (decidida 2026-08-11):
+#   1. esperar hasta MAXWAIT s a que la dGPU caiga sola a D3cold
+#   2. si cae    -> no tocar nada: el 99y blinda y systemd apaga normal
+#                   (0,46 W en una noche; el "~2 W" que se dice por todo el
+#                    proyecto es esa misma medida leida en una ventana de 20 min,
+#                    donde el E0 de la regla 1 aun no se ha repartido)
+#   3. si no cae -> armar GRUB para que haga `halt` y REINICIAR: 0,32 W,
+#                   al precio de un POST visible (~30 s)
+#
+# LAS DOS CIFRAS DE ARRIBA SON NOCHES ENTERAS, y por eso se pueden comparar entre
+# si (regla 1: los vatios brutos no sobreviven a un cambio de ventana). Antes la
+# rama 2 iba en vatios de ventana corta y la 3 en netos de otra medida distinta:
+# tres reglas de medida en tres renglones seguidos.
+#
+# DE DONDE SALE ESE 0,32 W, que antes aqui decia 0,11 y no se podia rastrear.
+# El 0,11 era aritmetica buena mal explicada: la fila `grub-halt` de
+# docs/EVIDENCE.md mide 0,785 Wh en 45 min y, restandole el E0 ~0,70 Wh que manda
+# la regla 1, quedan (0,785-0,70)/0,75 h = 0,11 W netos. Correcto, pero la tabla
+# del README publica esa MISMA medida como 1,05 W brutos, asi que el numero de
+# aqui parecia contradecir al de alli sin que nada hiciera de puente — en un
+# proyecto cuyo valor entero es que cada cifra se pueda seguir hasta su fila.
+# Ahora se cita la medida propia de ESTA rama, de punta a punta y sin restarle
+# nada: `politica-grub-real-v1` (2026-08-14), 3,034 Wh en 9,55 h => 0,32 W. Es
+# ademas un TECHO —la ventana incluye la maniobra despierta— o sea que como
+# promesa peca de prudente, que es como debe pecar.
+#
+# DONDE CORRE. s5-gpu-politica.service, colgada de poweroff.target y ordenada
+# `After=shutdown.target  Before=umount.target`. Es la ventana donde se cumplen
+# las DOS condiciones que la ordenacion SI puede dar:
+#   (a) ya no queda nada vivo que pueda volver a despertar la dGPU (gdm,
+#       user@1000, session-N.scope, nvidia-powerd, switcheroo-control,
+#       alsa-state: todas paradas antes de shutdown.target), asi que el juicio
+#       sobre su estado es representativo;
+#   (b) systemd nos ESPERA antes de cortar, porque systemd-poweroff.service es
+#       Requires=/After=umount.target.
+# Al colgar de poweroff.target no se activa en un `reboot`, que es justo lo
+# que queremos.
+#
+# LO QUE LA ORDENACION *NO* PUEDE DAR: /boot MONTADO. Aqui ya NO lo esta, y no
+# hay ventana que ganar. Por eso la rama de GRUB lo monta ella misma (paso 2a).
+# Medido en el apagado real del 2026-08-11 01:53:56, journal:
+#
+#     01:53:56.490  Unmounting boot-efi.mount
+#     01:53:56.546  Unmounted boot.mount           <- /boot ya no esta
+#     01:53:56.645  Reached target shutdown.target <- 100 ms DESPUES
+#     01:53:56.647  Starting s5-gpu-politica.service
+#     01:54:11.487  la politica decide
+#     01:54:11.489  Reached umount.target / final.target / poweroff.target
+#
+# Las UNIDADES DE MONTAJE mueren ANTES de que se alcance shutdown.target.
+# `umount.target` no es "cuando se desmonta todo": es un punto de
+# sincronizacion que se alcanza AL FINAL, cuando ya no queda nada montado (y
+# que en ese apagado nos espero a nosotros: 14,8 s). Corolario: CUALQUIER
+# ventana `After=shutdown.target` tiene /boot desmontado, siempre.
+#
+# Y ordenarse contra boot.mount tampoco sirve. Descartado por el manual, no
+# deducido — systemd.unit(5):
+#     "Given two units with any ordering dependency between them, if one unit
+#      is shut down and the other is started up, the shutdown is ordered before
+#      the start-up. It does not matter if the ordering dependency is After= or
+#      Before=, in this case."
+# Nosotros nos ARRANCAMOS mientras boot.mount se PARA => el desmontaje va
+# primero pongamos lo que pongamos. `RequiresMountsFor=/boot` es lo mismo
+# (implica After=boot.mount) y ademas mete un Requires= sobre una unidad con un
+# job de stop en la misma transaccion: peor.
+#
+# ESTO SE APRENDIO A GOLPES — 2026-08-11, dos disparos reales seguidos:
+#   - 00:57:45, ventana `After=final.target Before=poweroff.target`, fallo por
+#     los dos lados. `Before=poweroff.target` no ordenaba contra el apagado de
+#     verdad (poweroff.target es `After=systemd-poweroff.service`): esta unidad
+#     y systemd-poweroff.service eran hermanas sin orden entre ellas, y el
+#     script murio a mitad de la espera (el log tiene el "esperando hasta 90s"
+#     y ni una linea mas).
+#   - 01:53:56, ya con la ventana de ahora. La mitad de systemd quedo
+#     CONFIRMADA en un apagado real: corrimos tras shutdown.target y systemd
+#     nos espero. Pero el testigo volvio a cantar `boot=DESMONTADO`, y ahi se
+#     vio que la causa no era la que habiamos escrito (llegar tarde a
+#     umount.target) sino la de arriba: los montajes se van antes.
+# Razonamiento completo en la cabecera de s5-gpu-politica.service.
+#
+# FALLO SEGURO, SIEMPRE. Cualquier problema — no se puede montar /boot, no hay
+# grub2-reboot/grub-reboot, el grubenv no acepta el next_entry, este GRUB no
+# se registra y se deja el apagado seguir su curso normal. Se pierde el
+# ahorro; no se rompe el apagado. Nunca se aborta ni se cuelga: TimeoutStartSec
+# de la unidad es la ultima red.
+#
+# ANTI-BUCLE. La entrada de GRUB es de un solo uso (`grub{,2}-reboot` =>
+# next_entry, que GRUB consume y borra al usarla). El custom.cfg lo barre
+# s5-gpu-politica-cleanup.service en el arranque siguiente, y esa unidad esta
+# instalada de forma PERMANENTE — aqui no se instala nada, porque systemd ya
+# esta en la transaccion de apagado y un `systemctl enable` no es fiable.
+#
+# Freno de mano: /var/lib/s5-test/gpu-politica-disabled  (lo mira la unidad)
+# Ensayo en seco:  S5_POLITICA_DRYRUN=1  (hace todo menos escribir y reiniciar)
+
+set -u
+
+# QUE dispositivos. Antes estaban clavados aqui (GPU=0000:01:00.0 y compania):
+# correcto en la maquina donde se midio, y en otra la politica juzgaria el
+# estado del dispositivo equivocado y desviaria por GRUB cuando no toca. Salen
+# de sysfs — ver s5-descubre-dgpu. `PUENTE` es el nombre local de `BRIDGE`.
+DESCUBRE=${S5_DESCUBRE:-/usr/local/bin/s5-descubre-dgpu}   # overridable SOLO para ensayar (regla 22)
+GPU=''; AUDIO=''; BRIDGE=''
+# shellcheck source=/dev/null
+[ -r "$DESCUBRE" ] && . "$DESCUBRE"
+PUENTE="$BRIDGE"
+
+MAXWAIT=${S5_POLITICA_MAXWAIT:-90}
+POLL=0.5
+
+DRYRUN=${S5_POLITICA_DRYRUN:-0}
+# UN ENSAYO NO ESCRIBE EN EL LOG DE PRODUCCION (2026-08-11). Antes si, y basta
+# con ensayar una vez para que el ultimo bloque del log deje de ser el del
+# apagado real: `s5-mitigacion-check` correlaciona por ahi y volvia a dar un
+# falso FALLO, sin que nada dijera que la causa era un ensayo de hace un rato.
+# El hook 99y ya desviaba sus logs en seco; esto lo iguala. S5_POLITICA_LOG
+# manda SIEMPRE que este puesta, tambien fuera de dryrun: el ensayo de la rama
+# armada (custom.cfg real, grub-reboot real, el fallback reboot -f) necesita
+# desviar el log igual que el dry-run, o escribiria en el de produccion.
+# Overridable SOLO para ensayar (regla 22).
+LOG="${S5_POLITICA_LOG:-}"
+if [ -z "$LOG" ]; then
+    LOG=/var/log/s5-shutdown-pci.log          # el mismo del 99y: todo junto
+    [ "$DRYRUN" = 1 ] && LOG=/tmp/politica-dryrun-shutdown-pci.log
+fi
+# EL SABOR DE GRUB. Antes estaba clavado a lo de Fedora (`grub2-*`,
+# /boot/grub2). En Debian, Ubuntu y Arch son `grub-*` y /boot/grub, asi que esta
+# rama —el salvavidas del caso raro— no funcionaba en media distribucion. No
+# rompia nada (aborta y deja seguir el apagado), pero tampoco ahorraba.
+DESCUBRE_GRUB=${S5_DESCUBRE_GRUB:-/usr/local/bin/s5-descubre-grub}
+GRUB_DIR=''; GRUB_CUSTOM=''; GRUB_REBOOT=''; GRUB_EDITENV=''
+# shellcheck source=/dev/null
+[ -r "$DESCUBRE_GRUB" ] && . "$DESCUBRE_GRUB"
+# OJO AL ORDEN: los COMANDOS salen del PATH y ya estan, pero el DIRECTORIO se
+# busca exigiendo $d/grubenv, y en esta ventana del apagado /boot esta
+# DESMONTADO (regla 28) => aqui GRUB_DIR sale vacio casi siempre. Se vuelve a
+# descubrir mas abajo, despues de asegurar_boot. Esta primera pasada vale para
+# el ensayo en seco en caliente (donde /boot si esta montado) y para tener los
+# comandos cuanto antes.
+CUSTOM="$GRUB_CUSTOM"
+ENTRY_ID=s5politica
+MARCA='# s5-gpu-politica'                 # distingue nuestro custom.cfg del de s5-grub-halt
+
+rd()  { cat "$1" 2>/dev/null || echo '?'; }
+pst() { rd "/sys/bus/pci/devices/$1/power_state"; }
+rst() { rd "/sys/bus/pci/devices/$1/power/runtime_status"; }
+
+estado() { echo "dGPU=$(pst $GPU)/$(rst $GPU) audio=$(pst $AUDIO)/$(rst $AUDIO) puente=$(pst $PUENTE)/$(rst $PUENTE)"; }
+
+# El log vive en / (btrfs). Si ya estuviera en ro, no queremos que un fallo de
+# escritura mate el script con set -u/pipefail: todo va con || true.
+say() { printf '%s\n' "$@" >> "$LOG" 2>/dev/null || true; printf 's5-gpu-politica: %s\n' "$@" || true; }
+
+# Testigo de en que estado nos encontramos los montajes. Se escribe SIEMPRE,
+# tambien en la rama rapida, para poder leerlo en un apagado normal en vez de
+# esperar a que ocurra el caso raro.
+#
+# OJO CON LA LECTURA, que ya despisto una vez: `boot=DESMONTADO` aqui es lo
+# ESPERADO y NO es un fallo — los montajes se van antes de shutdown.target
+# (ver cabecera). Lo que importa es que la rama de GRUB sepa montarlo, y eso lo
+# dicen las lineas `POLITICA /boot: ...` de mas abajo, no esta.
+#   root=rw     -> normal: / sigue montado en rw en esta ventana
+#   root=ro     -> systemd ha cambiado algo; el log lo dira en vez de fallar
+#                  en silencio (regla 18)
+#   SIN-FINDMNT -> el testigo esta roto y no esta midiendo nada
+mnt() {   # mnt <punto> -> rw | ro | DESMONTADO | SIN-FINDMNT
+    command -v findmnt >/dev/null 2>&1 || { echo SIN-FINDMNT; return; }
+    local o; o=$(findmnt -no OPTIONS "$1" 2>/dev/null) || true
+    case ",$o," in
+        *,rw,*) echo rw ;;
+        *,ro,*) echo ro ;;
+        *)      echo DESMONTADO ;;
+    esac
+}
+montajes="root=$(mnt /) boot=$(mnt /boot)"
+say "===== $(date '+%F %T')  POLITICA GPU  dryrun=$DRYRUN  maxwait=${MAXWAIT}s  $montajes"
+
+# Sin dGPU localizada no hay juicio que emitir: no se sabe de quien mirar el
+# power_state, y desviar por GRUB "por si acaso" costaria un POST en cada
+# apagado de una maquina que a lo mejor no tiene el problema. Se registra y el
+# apagado sigue normal (fallo seguro, como todo lo demas de este script).
+if [ -z "$GPU" ]; then
+    say "POLITICA sin dGPU localizada ($([ -r "$DESCUBRE" ] && echo 's5-descubre-dgpu no encontro ninguna' || echo "falta $DESCUBRE")): no hay nada que decidir, apagado normal"
+    exit 0
+fi
+
+# --- 0. el caso normal: la dGPU ya esta dormida -----------------------------
+# Salida rapida y barata. En los 4 apagados limpios medidos cayo en <20 s, asi
+# que esta es la rama que se toma casi siempre y no cuesta nada.
+if [ "$(pst $GPU)" = D3cold ]; then
+    say "POLITICA sin riesgo: $(estado) => apagado normal (~2 W), no se toca nada"
+    exit 0
+fi
+
+# --- 1. esperar a que caiga sola --------------------------------------------
+say "POLITICA dGPU despierta al entrar: $(estado) — esperando hasta ${MAXWAIT}s"
+t=0
+traza="0:$(pst $GPU)"
+while [ "$(pst $GPU)" != D3cold ]; do
+    awk -v t="$t" -v m="$MAXWAIT" 'BEGIN{exit !(t >= m)}' && break
+    sleep "$POLL"
+    t=$(awk -v t="$t" -v p="$POLL" 'BEGIN{printf "%.1f", t+p}')
+    nuevo=$(pst $GPU)
+    case "$traza" in *":$nuevo") ;; *) traza="$traza ${t}:$nuevo" ;; esac
+done
+
+if [ "$(pst $GPU)" = D3cold ]; then
+    say "POLITICA la dGPU cayo sola en ${t}s (traza: $traza) => apagado normal (~2 W)" \
+        "POLITICA estado final: $(estado)"
+    exit 0
+fi
+
+# --- 2. no cayo: enrutar por GRUB -------------------------------------------
+say "POLITICA !!! la dGPU NO cayo a D3cold en ${t}s (traza: $traza)" \
+    "POLITICA estado: $(estado)" \
+    "POLITICA => el apagado normal costaria ~19 W; enrutando por GRUB (halt, ~0,32 W)"
+
+BOOT_NUESTRO=0        # 1 si el montaje de /boot lo hemos hecho nosotros
+
+# Deshacer SOLO lo que hayamos montado nosotros. Si /boot ya venia montado (una
+# maquina viva, un ensayo en seco), no se toca: no es nuestro.
+soltar_boot() {
+    [ "$BOOT_NUESTRO" = 1 ] || return 0
+    sync 2>/dev/null || true
+    umount /boot 2>/dev/null || umount -l /boot 2>/dev/null || true
+    BOOT_NUESTRO=0
+    say "POLITICA /boot: desmontado de vuelta (lo habiamos montado nosotros)"
+}
+
+abortar() {   # abortar la POLITICA, no el apagado: se sigue apagando normal
+    say "POLITICA ABORTADA: $1"
+    # Retirar SOLO un custom.cfg nuestro a medio escribir. Si el fichero es de
+    # otro (s5-grub-halt usa el mismo nombre), no se toca: abortamos aqui
+    # precisamente para no pisarlo. Va ANTES de soltar_boot, que si no el
+    # fichero deja de estar accesible.
+    if [ -e "$CUSTOM" ] && grep -q "$MARCA" "$CUSTOM" 2>/dev/null; then
+        rm -f "$CUSTOM" 2>/dev/null
+    fi
+    soltar_boot
+    say "POLITICA => se apaga por el camino normal; este S5 sera caro (~19 W)"
+    exit 0
+}
+
+# (a) /boot MONTADO EN rw. En esta ventana del apagado NO lo esta —los montajes
+#     mueren antes de shutdown.target, ver cabecera— asi que lo montamos
+#     nosotros. Solo hace falta en esta rama, la rara —nunca ha hecho falta por
+#     si sola en un apagado real medido aqui; las veces que ha entrado fueron
+#     controles forzados a proposito, ver docs/EVIDENCE.md— y por eso no se hace
+#     antes: el camino normal no toca /boot para nada.
+#
+#     `mount /boot` a secas es lo que se quiere: coge la entrada de /etc/fstab
+#     (UUID + `defaults`, o sea rw) y no duplica aqui una UUID.
+#
+#     HABIA UN RESPALDO CON LA UUID ESCRITA A MANO y se retiro el 2026-08-11 al
+#     preparar la publicacion, por dos razones. La primera es que no aportaba
+#     nada: la UUID clavada salia de ese mismo /etc/fstab, asi que como respaldo
+#     "por si fstab no sirve" era circular. La segunda es que era ACTIVAMENTE
+#     PELIGROSA fuera de la maquina de referencia — montar una UUID ajena en
+#     /boot para escribirle un custom.cfg es de las pocas cosas de este proyecto
+#     que pueden romper el arranque de otro. Si `mount /boot` falla, se aborta:
+#     el apagado sigue normal y solo se pierde el ahorro.
+asegurar_boot() {   # -> 0 si /boot queda utilizable en rw
+    case "$(mnt /boot)" in
+        rw) say "POLITICA /boot: ya estaba montado en rw, no lo toco"
+            return 0 ;;
+        ro) mount -o remount,rw /boot 2>/dev/null || true
+            [ "$(mnt /boot)" = rw ] || return 1
+            say "POLITICA /boot: estaba en ro, remontado en rw"
+            return 0 ;;
+        SIN-FINDMNT)
+            return 1 ;;
+        *)  # DESMONTADO: el caso normal en esta ventana
+            mount /boot 2>/dev/null || return 1
+            BOOT_NUESTRO=1
+            [ "$(mnt /boot)" = rw ] || return 1
+            say "POLITICA /boot: estaba desmontado (lo esperado); montado por nosotros en rw"
+            return 0 ;;
+    esac
+}
+
+asegurar_boot || abortar "no consigo /boot montado en rw (esta: $(mnt /boot))"
+
+# (a bis) AHORA que /boot esta montado, el directorio de GRUB ya se puede ver.
+# Se vuelve a descubrir: la pasada de arriba corrio con /boot desmontado y no
+# pudo encontrarlo. Sourcearlo otra vez es seguro — el descubridor reinicia sus
+# variables al empezar, asi que esto redetecta en vez de arrastrar lo anterior.
+# shellcheck source=/dev/null
+[ -r "$DESCUBRE_GRUB" ] && . "$DESCUBRE_GRUB"
+CUSTOM="$GRUB_CUSTOM"
+
+# (b) herramientas
+[ -n "$GRUB_REBOOT" ]  || abortar "no encuentro grub2-reboot ni grub-reboot"
+[ -n "$GRUB_EDITENV" ] || abortar "no encuentro grub2-editenv ni grub-editenv"
+[ -n "$CUSTOM" ]       || abortar "no encuentro el directorio de GRUB (ni /boot/grub2 ni /boot/grub con grubenv)"
+
+# (c) no pisar un custom.cfg ajeno (s5-grub-halt usa el mismo fichero)
+if [ -e "$CUSTOM" ] && ! grep -q "$MARCA" "$CUSTOM" 2>/dev/null; then
+    abortar "ya hay un custom.cfg que no es nuestro; no lo piso"
+fi
+
+if [ "$DRYRUN" = 1 ]; then
+    say "POLITICA DRYRUN: aqui escribiria $CUSTOM, haria $GRUB_REBOOT $ENTRY_ID, sync y reboot" \
+        "POLITICA DRYRUN: /boot rw=si (montado_por_nosotros=$BOOT_NUESTRO), $GRUB_REBOOT=si => la politica HABRIA actuado"
+    soltar_boot
+    exit 0
+fi
+
+# (d) entrada de un solo uso. Si este GRUB no trajera `halt`, la entrada falla,
+#     el menu expira y arranca Fedora normal: fallo benigno y visible.
+cat > "$CUSTOM" <<EOF || abortar "no pude escribir $CUSTOM"
+$MARCA — entrada de un solo uso; la borra s5-gpu-politica-cleanup.service.
+menuentry 'S5 — apagar desde GRUB (dGPU quedo despierta)' --id $ENTRY_ID {
+    echo "s5-gpu-politica: la dGPU no se durmio; apagando desde GRUB..."
+    halt
+}
+EOF
+chmod 0644 "$CUSTOM" 2>/dev/null
+
+"$GRUB_REBOOT" "$ENTRY_ID" >/dev/null 2>&1 || abortar "$GRUB_REBOOT fallo"
+"$GRUB_EDITENV" - list 2>/dev/null | grep -q "^next_entry=$ENTRY_ID$" || \
+    abortar "next_entry no quedo grabado en el grubenv"
+
+say "POLITICA armada: next_entry=$ENTRY_ID, $CUSTOM escrito (boot_montado_por_nosotros=$BOOT_NUESTRO)" \
+    "POLITICA reiniciando para que GRUB apague (veras un POST; es lo esperado)"
+
+# (e) soltar /boot ANTES de reiniciar. Ya no nos hace falta, y dejarlo montado
+#     seria dejarle a systemd un montaje que no conoce (su boot.mount esta
+#     parada) justo cuando va a rehacer la transaccion. Con sync dentro.
+sync
+soltar_boot
+
+# (f) reiniciar. En esta ventana / SIGUE montado en rw (lo dice el testigo
+#     `root=rw` de cada apagado), asi que el camino bueno es
+#     `systemctl --force reboot`: segun systemctl(1) mata los procesos a la
+#     brava pero SI desmonta o remonta en solo lectura los sistemas de ficheros.
+systemctl --force reboot >/dev/null 2>&1
+
+# Si systemctl no pudo (estamos dentro de una transaccion de apagado), a pelo.
+# Aqui `reboot -f` es la llamada al sistema pelada y no desmonta nada, asi que
+# antes bajamos a mano lo que quede: / es btrfs CoW (un corte con sync previo
+# equivale a un corte de corriente limpio), pero remontar en ro es gratis y
+# quita el susto. Va con `|| true`: si / esta ocupado el remonta falla y da
+# igual, seguimos. /boot ya no esta montado a estas alturas.
+sleep 3
+say "POLITICA systemctl --force reboot no dio la vuelta; usando reboot -f"
+sync
+mount -o remount,ro / 2>/dev/null || true
+sync
+exec reboot -f

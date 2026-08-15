@@ -1,0 +1,152 @@
+#!/bin/bash
+# s5-descubre-dgpu — localiza la GPU discreta, su funcion de audio y el puente
+# PCIe que la cuelga, SIN rutas clavadas.
+#
+# POR QUE EXISTE. Hasta el 2026-08-11 las tres direcciones estaban escritas a
+# mano en el hook y en la politica:
+#     GPU=0000:01:00.0  AUDIO=0000:01:00.1  BRIDGE=0000:00:01.1
+# Eso funciona en la maquina donde se midio y es ACTIVAMENTE PELIGROSO en
+# cualquier otra: el modulo blindaria el dispositivo que hubiera en esa ruta,
+# que puede ser el NVMe o la tarjeta de red. Un parche publicado no puede
+# llevar eso dentro.
+#
+# COMO LO BUSCA. Sysfs puro, sin `lspci`: el hook corre en pleno apagado, con
+# `/` en solo lectura y sin garantia de que /usr/sbin siga sirviendo. Solo se
+# usan `read` de bash y `readlink`.
+#
+#   dGPU   -> clase VGA (0x0300) o 3D controller (0x0302) cuyo vendor sea el
+#             buscado (por defecto 0x10de, NVIDIA). El filtro por vendor es lo
+#             que separa la discreta de la integrada: en el portatil de
+#             referencia conviven 0000:01:00.0 (0x10de) y 0000:06:00.0 (0x1002,
+#             amdgpu), y la integrada NO se debe tocar jamas.
+#   audio  -> la funcion .1 del MISMO dispositivo, y solo si de verdad es clase
+#             audio (0x0403). No se da por hecha: hay discretas sin ella.
+#   puente -> el padre en la topologia de sysfs, o sea el root port del que
+#             cuelga. Sale de resolver el symlink de /sys/bus/pci/devices.
+#
+# ESCAPE MANUAL. /etc/s5-poweroff-fix.conf puede fijar GPU=, AUDIO=, BRIDGE= y
+# S5_VENDOR=. Lo que se fije ahi gana; lo que no, se descubre. Pensado para
+# topologias raras (varias discretas, eGPU). Para desactivar una pieza a
+# proposito se le pone `none` (AUDIO=none, BRIDGE=none): vacio NO vale, ver
+# abajo el porque.
+#
+# CONTRATO. Se USA CON `.` (source), no se ejecuta: deja GPU, AUDIO y BRIDGE
+# puestas en el shell que lo llama. AUDIO y BRIDGE pueden quedar VACIAS y quien
+# llame TIENE que tolerarlo. Si no encuentra dGPU, GPU queda vacia y no hay
+# nada que blindar: no es un error, es una maquina sin el problema.
+#
+# Ejecutado a pelo (`s5-descubre-dgpu`) imprime lo que encontraria, que es como
+# se comprueba antes de instalar.
+
+S5_CONF=${S5_CONF:-/etc/s5-poweroff-fix.conf}
+S5_VENDOR=${S5_VENDOR:-0x10de}
+GPU=${GPU:-}
+AUDIO=${AUDIO:-}
+BRIDGE=${BRIDGE:-}
+
+# El .conf se lee ANTES de descubrir: lo fijado a mano manda y ni se busca.
+# shellcheck source=/dev/null
+[ -r "$S5_CONF" ] && . "$S5_CONF"
+
+# DESACTIVAR UNA PIEZA A PROPOSITO NECESITA UN CENTINELA, no basta con dejarla
+# vacia. La preinicializacion de arriba ya deja AUDIO y BRIDGE definidas-y-vacias
+# pase lo que pase, asi que ni `${AUDIO+x}` ni `-z` distinguen "el .conf lo puso
+# vacio" de "nadie lo toco": con `AUDIO=` a secas el descubrimiento lo rellenaba
+# igual y el audio acababa blindado de todas formas — lo contrario de lo que
+# prometian esta cabecera y el .conf de ejemplo.
+S5_SIN_AUDIO=0; S5_SIN_PUENTE=0
+[ "$AUDIO" = none ]  && { AUDIO='';  S5_SIN_AUDIO=1; }
+[ "$BRIDGE" = none ] && { BRIDGE=''; S5_SIN_PUENTE=1; }
+
+s5_lee() { local v=''; [ -r "$1" ] || return 1; read -r v < "$1" 2>/dev/null || return 1; printf '%s' "$v"; }
+
+s5_descubre_dgpu() {
+    local d c v
+    for d in /sys/bus/pci/devices/*; do
+        c="$(s5_lee "$d/class")"  || continue
+        v="$(s5_lee "$d/vendor")" || continue
+        case "$c" in 0x0300*|0x0302*) ;; *) continue ;; esac
+        [ "$v" = "$S5_VENDOR" ] || continue
+        printf '%s' "${d##*/}"
+        return 0
+    done
+    return 1
+}
+
+s5_descubre_audio() {   # s5_descubre_audio <bdf de la GPU>
+    local a c
+    a="${1%.*}.1"
+    c="$(s5_lee "/sys/bus/pci/devices/$a/class")" || return 1
+    case "$c" in 0x0403*) printf '%s' "$a"; return 0 ;; esac
+    return 1
+}
+
+s5_descubre_puente() {  # s5_descubre_puente <bdf de la GPU>
+    local p
+    p="$(readlink -f "/sys/bus/pci/devices/$1" 2>/dev/null)" || return 1
+    p="${p%/*}"; p="${p##*/}"
+    # El padre de una GPU colgada del root complex es `pci0000:00`, que no es un
+    # dispositivo: se rechaza. Solo vale algo con forma de BDF.
+    case "$p" in [0-9a-f]*:*:*.*) printf '%s' "$p"; return 0 ;; esac
+    return 1
+}
+
+[ -n "$GPU" ]    || GPU="$(s5_descubre_dgpu)"    || GPU=''
+if [ -n "$GPU" ]; then
+    [ -n "$AUDIO" ]  || [ "$S5_SIN_AUDIO" = 1 ]  || AUDIO="$(s5_descubre_audio  "$GPU")"  || AUDIO=''
+    [ -n "$BRIDGE" ] || [ "$S5_SIN_PUENTE" = 1 ] || BRIDGE="$(s5_descubre_puente "$GPU")" || BRIDGE=''
+fi
+
+# Lista para el parametro `devs=` del modulo, en el orden en que se blinda:
+# primero el puente, luego la GPU, luego su audio. Sin comas sueltas si falta
+# alguno, que el modulo escupiria "BDF ilegible".
+S5_DEVS=''
+for _d in "$BRIDGE" "$GPU" "$AUDIO"; do
+    [ -n "$_d" ] && S5_DEVS="${S5_DEVS:+$S5_DEVS,}$_d"
+done
+unset _d
+
+# Ejecutado en vez de sourceado: informe para comprobar antes de instalar.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    printf 'vendor buscado : %s\n' "$S5_VENDOR"
+    printf 'config         : %s\n' "$([ -r "$S5_CONF" ] && echo "$S5_CONF" || echo '(ninguna, todo descubierto)')"
+    printf 'dGPU           : %s\n' "${GPU:-(no encontrada)}"
+    printf 'audio          : %s\n' "${AUDIO:-(ninguna)}"
+    printf 'puente PCIe    : %s\n' "${BRIDGE:-(ninguno)}"
+    printf 'devs= para el modulo: %s\n' "${S5_DEVS:-(vacio)}"
+    [ -n "$GPU" ] || { echo; echo 'Sin GPU discreta del vendor buscado: esta maquina no tiene el problema,'; echo 'o hay que fijar GPU= a mano en '"$S5_CONF"'.'; exit 1; }
+
+    # LA LINEA DEL DRIVER ES EL TESTIGO QUE CAZA UN GPU= MAL PUESTO: si en vez
+    # de `nvidia` pone `nvme`, has clavado la direccion equivocada y el modulo
+    # blindaria tu disco. Por eso tiene que decir la verdad, y no la decia.
+    #
+    # `readlink -f` SOBRE UN SYMLINK QUE NO EXISTE DEVUELVE 0 e imprime la ruta
+    # igual — solo exige que exista el padre — asi que el `|| echo '(ninguno)'`
+    # que habia aqui no disparaba NUNCA. Una dGPU sin driver enlazado (nouveau
+    # en la lista negra, vfio, el modulo aun sin cargar) salia como
+    # `driver actual  : driver`, o sea el nombre del propio symlink. Se pregunta
+    # por el enlace primero, que es lo que ya hace drv() en
+    # 99-s5-pci-state.shutdown; alli estaba bien y aqui no.
+    ruta="/sys/bus/pci/devices/$GPU"
+
+    # Y SI EL BDF NO ESTA EN EL BUS, ANTES NI ESO: las dos lineas salian vacias
+    # (`driver actual  :` y `estado ahora   : /`) y el informe terminaba con
+    # rc=0, dando por buena una direccion inventada. Solo puede pasar con un
+    # GPU= clavado a mano en la configuracion —el descubrimiento solo devuelve
+    # cosas que existen— o sea justo en el caso que el .conf de ejemplo avisa
+    # que hay que verificar con `lspci -D`. Se dice y se sale con rc!=0, con lo
+    # que `install.sh` aborta en vez de instalar apuntando a la nada.
+    if [ ! -e "$ruta" ]; then
+        echo
+        echo "$GPU NO esta en el bus PCI de esta maquina."
+        echo "Viene fijado a mano en $S5_CONF: comprueba la direccion con 'lspci -D'."
+        exit 1
+    fi
+
+    if [ -L "$ruta/driver" ]; then
+        printf '\ndriver actual  : %s\n' "$(basename "$(readlink -f "$ruta/driver")")"
+    else
+        printf '\ndriver actual  : (ninguno)\n'
+    fi
+    printf 'estado ahora   : %s/%s\n' "$(s5_lee "$ruta/power_state")" "$(s5_lee "$ruta/power/runtime_status")"
+fi

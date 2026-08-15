@@ -1,0 +1,52 @@
+#!/bin/bash
+# s5-gpu-politica-cleanup — barre la entrada de GRUB de un solo uso que deja
+# s5-gpu-politica cuando tiene que enrutar el apagado por GRUB.
+#
+# Corre en CADA arranque desde s5-gpu-politica-cleanup.service, y sale enseguida
+# si no hay nada que barrer: la guarda es el `[ -e "$CUSTOM" ] || exit 0` de mas
+# abajo, no una ConditionPathExists de la unidad. La unidad la llevo hasta el
+# 2026-08-15, clavada a /boot/grub{,2}/custom.cfg, y eso dejaba sin barrer
+# —para siempre— la entrada de quien fijara S5_GRUB_DIR en otro sitio: un
+# fichero de unidad no lee configuracion, pero este script si (sourcea el
+# descubridor, igual que la politica que la escribio). El razonamiento entero
+# esta en la cabecera de la unidad.
+#
+# Esta instalada de forma permanente a proposito — la politica corre en mitad
+# del apagado, donde un `systemctl enable` no seria fiable, asi que la limpieza
+# no puede depender de que ella la instale.
+#
+# Solo toca lo NUESTRO: si el custom.cfg es de s5-grub-halt (que usa el mismo
+# fichero), lo deja en paz.
+
+set -u
+
+# el sabor de GRUB (grub2-* en Fedora/RHEL/SUSE, grub-* en Debian/Ubuntu/Arch)
+DESCUBRE_GRUB=${S5_DESCUBRE_GRUB:-/usr/local/bin/s5-descubre-grub}
+GRUB_DIR=''; GRUB_CUSTOM=''; GRUB_REBOOT=''; GRUB_EDITENV=''
+# shellcheck source=/dev/null
+[ -r "$DESCUBRE_GRUB" ] && . "$DESCUBRE_GRUB"
+CUSTOM="$GRUB_CUSTOM"
+ENTRY_ID=s5politica
+MARCA='# s5-gpu-politica'
+LOG=/var/log/s5-shutdown-pci.log
+
+say() { printf '%s\n' "$@" >> "$LOG" 2>/dev/null || true; printf 's5-gpu-politica-cleanup: %s\n' "$@"; }
+
+[ -e "$CUSTOM" ] || exit 0
+
+if ! grep -q "$MARCA" "$CUSTOM" 2>/dev/null; then
+    say "$(date '+%F %T')  custom.cfg presente pero NO es nuestro; no lo toco"
+    exit 0
+fi
+
+rm -f "$CUSTOM" && say "$(date '+%F %T')  LIMPIEZA: borrado $CUSTOM (la politica actuo en el apagado anterior)"
+
+# next_entry deberia estar ya consumido por GRUB; por si el reinicio no llego a
+# pasar por el (p.ej. se corto la corriente), lo quitamos si sigue siendo el
+# nuestro. Nunca borramos un next_entry ajeno.
+if [ -n "$GRUB_EDITENV" ] && "$GRUB_EDITENV" - list 2>/dev/null | grep -q "^next_entry=$ENTRY_ID$"; then
+    "$GRUB_EDITENV" - unset next_entry 2>/dev/null && \
+        say "  y quitado next_entry=$ENTRY_ID, que habia quedado sin consumir"
+fi
+
+exit 0
