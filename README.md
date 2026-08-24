@@ -209,15 +209,15 @@ Honestly:
 
 - Measured on **one machine** (HP OMEN 16-ap0xxx, Fedora 44, RTX + integrated Radeon).
   The mechanism is generic; the numbers are not.
-- The overnight measurement is at **n=4** (0.46 / 0.46 / 0.47 / 0.45 W), but all four are
-  the same laptop: they repeat the measurement, they do not make it independent.
+- The overnight measurement is at **n=5** (0.46 / 0.46 / 0.47 / 0.45 / 0.45 W), but all
+  five are the same laptop: they repeat the measurement, they do not make it independent.
 - The **GRUB branch** has now been measured over a whole night (`politica-grub-real-v1`,
   2026-08-14: 0.32 W over 9.55 h), but at **n=1**, and only ever with the dGPU pinned to
   D0 by hand to force it. Nobody has yet seen it fire because a real workload held the
   GPU awake.
-- It **has** survived a kernel upgrade (2026-08-13). That was the most likely silent
-  failure. It is still the thing to watch after every kernel update, which is what
-  `s5-mitigacion-check` is for.
+- It **has** survived two kernel upgrades (2026-08-13, 2026-08-24). That was the most
+  likely silent failure. It is still the thing to watch after every kernel update, which
+  is what `s5-mitigacion-check` is for.
 - This is a **userspace mitigation of a kernel problem**, not the fix. The real fix
   belongs upstream: `pci_device_shutdown()` should not resurrect devices that are already
   in D3cold and whose driver does not need `shutdown()`.

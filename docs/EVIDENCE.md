@@ -72,11 +72,12 @@ battery `energy_now` reading before and after.
 | 08-14 | **`politica-grub-real-v1`** | **dGPU pinned in D0**: the policy waited 90 s, it never fell, and it diverted the shutdown through GRUB | **3.034 Wh** / 9.55 h ⇒ **0.32 W** | **CLEAN** ⇒ **the rare case works** |
 | 08-15 | **`nocturna-real-v4`** | **a whole night**, nothing armed, nothing changed since v3 | **3.265 Wh** / 7.31 h ⇒ **0.45 W** | **CLEAN** |
 | 08-15 | **`hook-reordenado-v1`** | first shutdown after `99y` was reordered to source the discovery **before** the handbrake branch | **0.632 Wh** / 0.41 h ⇒ **1.52 W** | **CLEAN** — a 20-min window, compare against `pmrt-clean` (1.77-2.09 W), **not** against the nights (rule 1) |
+| 08-24 | **`nocturna-real-v5`** | **a whole night, now on kernel 7.1.9-200** (akmod rebuilt itself again) | **3.249 Wh** / 7.22 h ⇒ **0.45 W** | **CLEAN** |
 
-**The four `nocturna-real` rows are the ones that count** — not because the wattage is lower
+**The five `nocturna-real` rows are the ones that count** — not because the wattage is lower
 than the 20-minute windows (it is the same figure, with E₀ amortised over a window 20×
 longer, rule 1) but because they are long and real. On 08-07 the machine went from full
-to **0% in ~8 h**; across these four it spent 3.3 / 3.9 / 3.5 / 3.3 Wh.
+to **0% in ~8 h**; across these five it spent 3.3 / 3.9 / 3.5 / 3.3 / 3.2 Wh.
 
 **The third one closes the most likely failure mode of all.** A hand-built `.ko` carries
 its kernel's `vermagic`, `insmod` rejects it, and the mitigation dies **silently**: the
@@ -84,6 +85,12 @@ shutdown looks just as good and costs 19 W again. On 2026-08-13 the machine actu
 crossed `7.1.7-200` → `7.1.8-200`, akmods rebuilt the module by itself, and the following
 night — **entirely on the new kernel** — measured 0.47 W. Not "the module loaded": the
 saving was still there.
+
+**The fifth repeats that same check across a second kernel crossing.** On 2026-08-24 the
+machine crossed `7.1.8-200` → `7.1.9-200`; `s5-mitigacion-check` confirmed the akmod
+rebuilt clean for the new `uname -r` with no build failures, and that same night — again
+entirely on the new kernel — measured 0.45 W. Same silent-failure mode, checked again,
+still not triggered.
 
 ## The rare case, rehearsed end to end (`politica-grub-real-v1`)
 
