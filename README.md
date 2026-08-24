@@ -209,8 +209,9 @@ Honestly:
 
 - Measured on **one machine** (HP OMEN 16-ap0xxx, Fedora 44, RTX + integrated Radeon).
   The mechanism is generic; the numbers are not.
-- The overnight measurement is at **n=5** (0.46 / 0.46 / 0.47 / 0.45 / 0.45 W), but all
-  five are the same laptop: they repeat the measurement, they do not make it independent.
+- The overnight measurement is at **n=8** (0.46 / 0.46 / 0.47 / 0.45 / 0.41 / 0.42 / 0.43 /
+  0.45 W), but all eight are the same laptop: they repeat the measurement, they do not
+  make it independent.
 - The **GRUB branch** has now been measured over a whole night (`politica-grub-real-v1`,
   2026-08-14: 0.32 W over 9.55 h), but at **n=1**, and only ever with the dGPU pinned to
   D0 by hand to force it. Nobody has yet seen it fire because a real workload held the
