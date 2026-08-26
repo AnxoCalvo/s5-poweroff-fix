@@ -76,6 +76,7 @@ battery `energy_now` reading before and after.
 | 08-22 | **`nocturna-real-v6`** | **a whole night**, nothing armed, nothing changed since v5 | **3.558 Wh** / 8.52 h ⇒ **0.42 W** | **CLEAN** |
 | 08-23 | **`nocturna-real-v7`** | **a whole night**, nothing armed, nothing changed since v6 | **3.203 Wh** / 7.38 h ⇒ **0.43 W** | **CLEAN** |
 | 08-24 | **`nocturna-real-v8`** | **a whole night, now on kernel 7.1.9-200** (akmod rebuilt itself again) | **3.249 Wh** / 7.22 h ⇒ **0.45 W** | **CLEAN** |
+| 08-26 | **`tras-actualizar-kernel-v2`** | first shutdown on **7.1.10-200** (crossed from 7.1.9-200), akmod rebuilt itself | **0.786 Wh** / 0.71 h ⇒ **1.10 W** | **CLEAN** |
 
 **The eight `nocturna-real` rows are the ones that count** — not because the wattage is lower
 than the 20-minute windows (it is the same figure, with E₀ amortised over a window 20×
@@ -93,6 +94,13 @@ saving was still there.
 machine crossed `7.1.8-200` → `7.1.9-200`; `s5-mitigacion-check` confirmed the akmod
 rebuilt clean for the new `uname -r` with no build failures, and that same night — again
 entirely on the new kernel — measured 0.45 W. Same silent-failure mode, checked again,
+still not triggered.
+
+**The third crossing repeats the same check with a cleaner number.** On 2026-08-26 the
+machine crossed `7.1.9-200` → `7.1.10-200`; `s5-mitigacion-check` confirmed the akmod
+rebuilt clean for the new `uname -r` with no build failures, and the first shutdown on the
+new kernel measured **0.786 Wh over 0.71 h ⇒ 1.10 W**, comparable to the 1.58 W raw of the
+first crossing (`tras-actualizar-kernel`, 08-13). Third crossing, same silent-failure mode,
 still not triggered.
 
 ## The rare case, rehearsed end to end (`politica-grub-real-v1`)

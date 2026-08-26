@@ -216,9 +216,9 @@ Honestly:
   2026-08-14: 0.32 W over 9.55 h), but at **n=1**, and only ever with the dGPU pinned to
   D0 by hand to force it. Nobody has yet seen it fire because a real workload held the
   GPU awake.
-- It **has** survived two kernel upgrades (2026-08-13, 2026-08-24). That was the most
-  likely silent failure. It is still the thing to watch after every kernel update, which
-  is what `s5-mitigacion-check` is for.
+- It **has** survived three kernel upgrades (2026-08-13, 2026-08-24, 2026-08-26). That was
+  the most likely silent failure. It is still the thing to watch after every kernel
+  update, which is what `s5-mitigacion-check` is for.
 - This is a **userspace mitigation of a kernel problem**, not the fix. The real fix
   belongs upstream: `pci_device_shutdown()` should not resurrect devices that are already
   in D3cold and whose driver does not need `shutdown()`.
