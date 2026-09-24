@@ -77,6 +77,12 @@ battery `energy_now` reading before and after.
 | 08-23 | **`nocturna-real-v7`** | **a whole night**, nothing armed, nothing changed since v6 | **3.203 Wh** / 7.38 h ⇒ **0.43 W** | **CLEAN** |
 | 08-24 | **`nocturna-real-v8`** | **a whole night, now on kernel 7.1.9-200** (akmod rebuilt itself again) | **3.249 Wh** / 7.22 h ⇒ **0.45 W** | **CLEAN** |
 | 08-26 | **`tras-actualizar-kernel-v2`** | first shutdown on **7.1.10-200** (crossed from 7.1.9-200), akmod rebuilt itself | **0.786 Wh** / 0.71 h ⇒ **1.10 W** | **CLEAN** |
+| 09-03 | **`tras-actualizar-kernel-v3`** | a whole night, first shutdown on **7.1.12-200**, akmod rebuilt itself | **3.064 Wh** / 7.44 h ⇒ **0.41 W** | **CLEAN** |
+| 09-06 | **`tras-actualizar-kernel-v4`** | a whole night, first shutdown on **7.1.13-200** | **3.803 Wh** / 8.51 h ⇒ **0.45 W** | **CLEAN** |
+| 09-13 | **`tras-actualizar-kernel-v5`** | a whole night on **7.2.4-200** — **the 7.1 → 7.2 jump**; the first shutdown on it (09-12) was plugged in and cannot be scored | **1.740 Wh** / 7.10 h ⇒ **0.24 W** | **CLEAN** (low regime, see below) |
+| 09-14 | **`tras-actualizar-kernel-v6`** | a whole night, first shutdown on **7.2.5-200** | **2.017 Wh** / 9.33 h ⇒ **0.22 W** | **CLEAN** (low regime, see below) |
+| 09-23 | `tras-actualizar-kernel-v7` | a whole night, first shutdown on **7.2.6-200** | 0.000 Wh / 7.69 h — gauge pinned at 100 % at both ends | **NOT SCORABLE** (shield ran: `disable=3 shutdown_anulados=2`) |
+| 09-24 | **`tras-actualizar-kernel-v8`** | a whole night on **7.2.7-200** (the first shutdown on it, 09-23, lasted 3.5 min and is all E₀) | **3.512 Wh** / 8.55 h ⇒ **0.41 W** | **CLEAN** |
 
 **The eight `nocturna-real` rows are the ones that count** — not because the wattage is lower
 than the 20-minute windows (it is the same figure, with E₀ amortised over a window 20×
@@ -102,6 +108,35 @@ rebuilt clean for the new `uname -r` with no build failures, and the first shutd
 new kernel measured **0.786 Wh over 0.71 h ⇒ 1.10 W**, comparable to the 1.58 W raw of the
 first crossing (`tras-actualizar-kernel`, 08-13). Third crossing, same silent-failure mode,
 still not triggered.
+
+**Six more crossings, one of them a minor-series jump.** Between 2026-09-02 and 2026-09-23
+the machine went through `7.1.12`, `7.1.13`, `7.2.4`, `7.2.5`, `7.2.6` and `7.2.7` (all
+`-200.fc44`). Each time akmods built `kmod-s5-pmrt-arm` for the new `uname -r` within two
+minutes of the kernel transaction (`dnf history`), and every poweroff on every one of them
+loaded it (`PMRT insmod rc=0 via=akmod`) and shielded all three devices
+(`disable=3 shutdown_anulados=2`), per `/var/log/s5-shutdown-pci.log`. On the last one,
+`s5-mitigacion-check` (2026-09-24) confirmed the akmod module for `7.2.7-200` with no build
+failures and came back all in order (it only looks at the running kernel, so for the other
+five the witnesses are the log and `dnf history`). Five of the six have a
+whole scorable night on battery. `7.2.6` does not: the battery started the night at 100 %,
+and while it sits there the gauge reports no drop at all (the 09-22 night on `7.2.5` read
+0.000 Wh for the same reason). That row proves the shield ran, not what it saved.
+
+**The 0.22-0.24 W nights are not the 7.2 kernel.** From 09-09 to 09-18 every scorable night
+came out at about half the usual figure (0.20-0.24 W). That regime began on `7.1.13` — the
+same kernel that measured 0.45 W on 09-06 — and ended on `7.2.5`, which measured 0.47 W on
+09-20; since then the series is back at 0.41-0.47 W. It does not follow any kernel, and its
+cause is not known. The gauge is a suspect: in the middle of it, the 09-15 night reported
+**+0.662 Wh gained** over 10.89 h on battery while the percentage fell 74 → 71 %, which is not
+physical. Either way, all of it sits well under the 1 W success line.
+
+**None of these kernels fixes the bug itself.** That was checked in the source, not in the
+wattage — the wattage cannot tell, because the shield ran on every one of these shutdowns.
+`pci_device_shutdown()` in `drivers/pci/pci-driver.c` is identical in the stable tags
+`v7.1.10`, `v7.1.13` and `v7.2.7` and in mainline (`7.3-rc4`, fetched 2026-09-24): it still
+calls `pm_runtime_resume(dev)` unconditionally before `drv->shutdown()`. Its caller,
+`device_shutdown()` in `drivers/base/core.c`, is identical between `v7.1.10` and `v7.2.7`, and
+`kernel_power_off()` still goes through it. The shield is still needed.
 
 ## The rare case, rehearsed end to end (`politica-grub-real-v1`)
 
