@@ -3,7 +3,7 @@
 
 Name:           s5-pmrt-arm-kmod
 Version:        1.0
-Release:        3%{?dist}
+Release:        4%{?dist}
 Summary:        Mitigacion del drenaje en S5 causado por la dGPU en portatiles hibridos
 License:        GPL-2.0-only
 URL:            https://github.com/AnxoCalvo/s5-poweroff-fix
@@ -69,6 +69,18 @@ install -m 644 kernel/s5_pmrt_arm.c kernel/Makefile $RPM_BUILD_ROOT%{_datadir}/s
 %{_datadir}/s5-pmrt-arm/
 
 %changelog
+* Sat Oct 03 2026 december172 <george.december172@gmail.com> - 1.0-4
+- ESPERA_D3COLD: antes de blindar, si el dispositivo no esta en D3cold se le pide
+  el idle al nucleo (pm_request_idle) y se sondea hasta que llegue o venza un
+  plazo comun (wait_ms=, 5 s por defecto, 0 lo desactiva). Cierra la rama que el
+  gancho de apagado ya avisaba — "la dGPU NO llego a D3cold en 20s, se blinda
+  igualmente" —: blindar una GPU despierta la congela despierta y ese S5 volvia a
+  costar ~18-20 W. Medido en un OMEN 16-ap0xxx (2026-10-03): la discreta seguia en
+  D0 seis segundos despues de que userspace la soltara, sin nadie que la tuviera
+  abierta, y el apagado con la espera activa salio frio y a <=1 W sobre 50 min.
+- El testigo va en linea propia (`ESPERA_D3COLD total=... ms`), NUNCA dentro de la
+  linea FIN: s5-mitigacion-check la parsea con `FIN +disable=... +shutdown_anulados=`.
+
 * Fri Aug 14 2026 AnxoCalvo <257994910+AnxoCalvo@users.noreply.github.com> - 1.0-3
 - devs= deja de traer una lista por defecto: eran los BDF de la maquina donde se
   diagnostico esto, y un `modprobe arm=1` a mano en otra habria blindado lo que

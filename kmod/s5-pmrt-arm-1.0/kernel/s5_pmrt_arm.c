@@ -6,6 +6,15 @@
  * subarbol de la discreta contra las DOS cosas que `pci_device_shutdown()` hace
  * y que lo devuelven a D0:
  *
+ *   (ESPERA_D3COLD) `pm_request_idle()` + espera acotada a D3cold (`wait_ms`,
+ *       5 s por defecto) ANTES de (a) y (b). Blindar una GPU DESPIERTA la
+ *       congela despierta: con disable_depth > 0 el nucleo ya no la suspende
+ *       tampoco, el riel no se corta y el S5 vuelve a costar ~18-20 W. No es
+ *       teorico — en la maquina de la aportacion (OMEN 16-ap0xxx, 2026-10-03)
+ *       la discreta seguia en D0 seis segundos despues de que userspace la
+ *       soltara, sin nadie que la tuviera abierta: hay drivers que no la
+ *       suspenden solos. Ver espera_d3cold().
+ *
  *   (a) `pm_runtime_resume(dev)`  -> se rebota con -EACCES gracias a
  *       `__pm_runtime_disable(dev, false)`. VALIDADO EN CALIENTE EN EL PASO 0
  *       (2026-08-10 20:26): deja el dispositivo en D3cold, rc=-13, y el testigo
@@ -38,8 +47,11 @@
 #include <linux/string.h>
 #include <linux/pci.h>
 #include <linux/pm_runtime.h>
+#include <linux/delay.h>
+#include <linux/jiffies.h>
 
 #define MAX_DEVS 8
+#define ESPERA_POLL_MS 100
 
 /*
  * SIN LISTA POR DEFECTO, A PROPOSITO. Aqui habia clavados los tres BDF de la
@@ -53,6 +65,7 @@
 static char *devs = "";
 static char *noshut = "nvidia,snd_hda_intel";
 static int arm;
+static unsigned int wait_ms = 5000;
 
 module_param(devs, charp, 0444);
 MODULE_PARM_DESC(devs, "BDFs separados por comas (OBLIGATORIO: sin el no se blinda nada)");
@@ -60,6 +73,8 @@ module_param(noshut, charp, 0444);
 MODULE_PARM_DESC(noshut, "lista blanca de drivers a los que anular .shutdown");
 module_param(arm, int, 0444);
 MODULE_PARM_DESC(arm, "0 = ensayo en seco; 1 = actua");
+module_param(wait_ms, uint, 0444);
+MODULE_PARM_DESC(wait_ms, "ms de espera a D3cold antes de blindar cada BDF (0 = no esperar)");
 
 static const char *rpm_name(enum rpm_status s)
 {
@@ -96,12 +111,73 @@ static void informe(const char *cuando, const char *bdf, struct pci_dev *pdev)
 		 rpm_name(d->power.runtime_status), d->power.disable_depth);
 }
 
+/*
+ * ESPERA_D3COLD — ESPERA ACTIVA ANTES DE BLINDAR.
+ *
+ * El gancho de apagado espera en userspace a que la dGPU baje a D3cold, pero si
+ * el plazo vence blinda igualmente; y blindar una GPU despierta la CONGELA
+ * despierta, asi que ese S5 cuesta otra vez los ~18-20 W. No es hipotetico: en
+ * la maquina de la aportacion (OMEN 16-ap0xxx, 2026-10-03) la discreta seguia
+ * en D0 seis segundos despues de que userspace la soltara, SIN nadie que la
+ * tuviera abierta — hay drivers que no la suspenden solos.
+ *
+ * Aqui se le PIDE el idle al nucleo (`pm_request_idle()`, la misma evaluacion
+ * que dispara el `pm_runtime_put()` de un driver) y se sondea hasta que el
+ * dispositivo reporta D3cold o se agota el plazo comun (`wait_ms`). D3cold es
+ * el unico estado que significa "riel cortado"; D3hot sigue alimentado.
+ *
+ * Nada se fuerza: si un driver mantiene una referencia, el dispositivo se queda
+ * despierto, se dice en el log y se blinda igual que antes — el peor caso sigue
+ * siendo el de siempre, nunca peor. Cuando ya esta en D3cold no se espera nada:
+ * la funcion vuelve sin tocar el reloj.
+ *
+ * TIENE QUE IR ANTES DE __pm_runtime_disable(): con disable_depth > 0 el nucleo
+ * ya no suspende al dispositivo tampoco, o sea que deshabilitar el runtime PM
+ * con la GPU despierta es justo lo que impide que el riel se corte.
+ */
+static unsigned int espera_d3cold(const char *bdf, struct pci_dev *pdev,
+				  unsigned long fin)
+{
+	pci_power_t est = pdev->current_state;
+	unsigned int esperado = 0;
+
+	if (est == PCI_D3cold || !wait_ms)
+		return 0;
+
+	pr_emerg("s5-pmrt-arm: %-14s esta en %s, no dormido: se pide idle y se espera a D3cold\n",
+		 bdf, pci_power_name(est));
+
+	while (time_before(jiffies, fin)) {
+		pm_request_idle(&pdev->dev);
+		msleep(ESPERA_POLL_MS);
+		esperado += ESPERA_POLL_MS;
+
+		if (pdev->current_state == PCI_D3cold) {
+			pr_emerg("s5-pmrt-arm: %-14s D3cold tras %u ms\n",
+				 bdf, esperado);
+			return esperado;
+		}
+		if (pdev->current_state != est) {
+			est = pdev->current_state;
+			pr_emerg("s5-pmrt-arm: %-14s ahora %s (%u ms)\n",
+				 bdf, pci_power_name(est), esperado);
+		}
+	}
+
+	pr_emerg("s5-pmrt-arm: %-14s sigue en %s tras %u ms: no se espera mas, se blinda igual\n",
+		 bdf, pci_power_name(pdev->current_state), esperado);
+	return esperado;
+}
+
 static int __init s5_pmrt_arm_init(void)
 {
 	char *copia, *resto, *bdf;
 	int hechos = 0, anulados = 0;
+	unsigned int esperado_ms = 0;
+	unsigned long fin;
 
-	pr_emerg("s5-pmrt-arm: ===== arm=%d devs=%s noshut=%s\n", arm, devs, noshut);
+	pr_emerg("s5-pmrt-arm: ===== arm=%d devs=%s noshut=%s wait_ms=%u\n",
+		 arm, devs, noshut, wait_ms);
 
 	/*
 	 * Sin lista no hay nada que blindar, y con arm=1 es ademas una llamada
@@ -118,6 +194,14 @@ static int __init s5_pmrt_arm_init(void)
 	if (!copia)
 		return -ENOMEM;
 	resto = copia;
+
+	/*
+	 * Plazo COMUN para toda la lista, no uno por dispositivo: la topologia
+	 * viene ordenada de hijo a padre (dGPU, audio, puente) y el puente solo
+	 * puede dormir cuando sus hijos ya duermen, asi que esperar por separado
+	 * multiplicaria la tardanza del peor apagado por el numero de BDF.
+	 */
+	fin = jiffies + msecs_to_jiffies(wait_ms);
 
 	while ((bdf = strsep(&resto, ",")) != NULL) {
 		unsigned int dom, bus, slot, fn;
@@ -151,6 +235,14 @@ static int __init s5_pmrt_arm_init(void)
 			continue;
 		}
 
+		/*
+		 * primero dormirla, y solo despues blindarla: con el runtime PM
+		 * deshabilitado el nucleo ya no la suspende, asi que blindar una
+		 * GPU despierta la deja despierta para todo el S5
+		 * (ESPERA_D3COLD, ver arriba).
+		 */
+		esperado_ms += espera_d3cold(bdf, pdev, fin);
+
 		/* (a) que el pm_runtime_resume() del apagado rebote */
 		__pm_runtime_disable(&pdev->dev, false);
 		hechos++;
@@ -170,6 +262,15 @@ static int __init s5_pmrt_arm_init(void)
 	}
 
 	kfree(copia);
+	/*
+	 * Testigo de ESPERA_D3COLD, en linea propia y NUNCA dentro de la linea FIN: hay
+	 * herramientas (s5-mitigacion-check) que la parsean con
+	 * `FIN +disable=([0-9]+) +shutdown_anulados=([0-9]+)` y anadirle campos
+	 * detras rompe esa lectura.
+	 */
+	if (arm)
+		pr_emerg("s5-pmrt-arm: ESPERA_D3COLD total=%u ms (wait_ms=%u)\n",
+			 esperado_ms, wait_ms);
 	pr_emerg("s5-pmrt-arm: FIN  disable=%d shutdown_anulados=%d  => systemd apaga por el camino NORMAL\n",
 		 hechos, anulados);
 	return 0;
