@@ -1,0 +1,154 @@
+#!/bin/bash
+# s5-descubre-boot — localiza lo que hace falta para apagar desde el FIRMWARE en
+# una maquina con systemd-boot (el equivalente del `halt` de GRUB).
+#
+# Se USA CON `.` (source), no se ejecuta: deja puestas
+#
+#     BOOT_ESP        punto de montaje de la ESP (/boot, /efi, /boot/efi...)
+#     BOOT_BOOTCTL    el binario bootctl, o vacio
+#     BOOT_ONESHOT    "si" si este systemd-boot entiende entradas de un solo uso
+#     BOOT_EFIVARS    /sys/firmware/efi/efivars (hace falta para armar)
+#     BOOT_HALT_ID    identificador de la entrada (s5-halt)
+#     BOOT_HALT_EFI   ruta de la aplicacion EFI de apagado EN LA ESP
+#     BOOT_HALT_ENTRY fichero de la entrada en $BOOT_ESP/loader/entries
+#     BOOT_LIMITE     por que NO se puede usar, si no se puede (texto o vacio)
+#
+# y vacio lo que no encuentre, para que quien llama decida (todos los que lo usan
+# fallan seguro: se registra y el apagado sigue su curso normal).
+#
+# POR QUE EXISTE. La rama del caso raro de s5-gpu-politica apaga desde GRUB con
+# `halt`, y eso funciona porque en ese arranque NO llega a ejecutarse ningun
+# kernel de Linux: el firmware hace su propio S5 con el hardware tal y como lo
+# dejo el POST. En una maquina con systemd-boot no hay `halt` que valga, asi que
+# el equivalente es una entrada de un solo uso que arranca una aplicacion EFI de
+# tres instrucciones (ResetSystem(EfiResetShutdown)) — sin kernel, sin disco,
+# sin nada que pueda volver a encender la dGPU.
+#
+# Se detecta cada cosa POR SEPARADO y no se deduce una de otra, por el mismo
+# motivo que en s5-descubre-grub: tener `bootctl` no implica tener la ESP
+# montada, ni que este firmware deje escribir variables EFI. Todo lo que falte se
+# dice con nombre y apellido en BOOT_LIMITE.
+#
+# ESCAPE MANUAL en /etc/s5-poweroff-fix.conf: S5_ESP, S5_BOOTCTL y
+# S5_BOOT_ENTRIES. Lo que se fije ahi gana y ni se busca.
+#
+#   s5-descubre-boot          ejecutado a pelo, imprime lo que encuentra
+#
+# S5_ESP_DIRS existe SOLO para ensayar (regla 22): permite apuntar la busqueda a
+# directorios de mentira y provocar las ramas sin tocar la ESP de verdad.
+
+S5_CONF=${S5_CONF:-/etc/s5-poweroff-fix.conf}
+# shellcheck source=/dev/null
+[ -r "$S5_CONF" ] && . "$S5_CONF"
+
+BOOT_ESP="${S5_ESP:-}"
+BOOT_BOOTCTL="${S5_BOOTCTL:-}"
+BOOT_ENTRIES="${S5_BOOT_ENTRIES:-}"
+BOOT_HALT_ID=s5-halt
+BOOT_ONESHOT=''
+BOOT_LIMITE=''
+BOOT_SB=''
+
+# --- la ESP ---------------------------------------------------------------
+# Primero se le pregunta a bootctl, que ya sabe leer /etc/fstab y el montaje
+# real; y solo si no esta se prueba la lista de siempre. El orden importa: una
+# ESP montada en un sitio raro es justo el caso que la lista no cubre.
+if [ -z "$BOOT_ESP" ] && [ -n "$BOOT_BOOTCTL" ]; then
+    BOOT_ESP="$("$BOOT_BOOTCTL" --print-esp-path 2>/dev/null)"
+fi
+if [ -z "$BOOT_ESP" ]; then
+    for d in ${S5_ESP_DIRS:-/boot /efi /boot/efi}; do
+        [ -d "$d/loader" ] || [ -d "$d/EFI" ] || continue
+        BOOT_ESP="$d"
+        break
+    done
+fi
+# La ESP tiene que tener las DOS cosas: `loader/entries`, que es donde va la
+# entrada, y `EFI`, que es donde va la aplicacion. Un /boot que solo tiene
+# vmlinuz (el caso de una maquina con GRUB y /boot aparte) no sirve.
+if [ -n "$BOOT_ESP" ] && { [ ! -d "$BOOT_ESP/loader/entries" ] || [ ! -d "$BOOT_ESP/EFI" ]; }; then
+    BOOT_LIMITE="${BOOT_LIMITE:+$BOOT_LIMITE; }$BOOT_ESP no parece una ESP de systemd-boot (falta loader/entries o EFI)"
+fi
+
+# --- bootctl y la entrada de un solo uso ---------------------------------
+if [ -z "$BOOT_BOOTCTL" ]; then
+    for c in bootctl; do
+        command -v "$c" >/dev/null 2>&1 && { BOOT_BOOTCTL="$(command -v "$c")"; break; }
+    done
+fi
+[ -n "$BOOT_BOOTCTL" ] || BOOT_LIMITE="${BOOT_LIMITE:+$BOOT_LIMITE; }no encuentro bootctl"
+
+# La capacidad se pregunta, no se deduce de la version: `bootctl status` publica
+# la lista de Features del cargador que hay en la ESP, y ahi esta "One-shot entry
+# control". Es la misma casa la que escribe las dos cosas, asi que esto es una
+# lectura directa y no una suposicion sobre versiones.
+if [ -n "$BOOT_BOOTCTL" ]; then
+    if "$BOOT_BOOTCTL" status 2>/dev/null | grep -q 'One-shot entry control'; then
+        BOOT_ONESHOT=si
+    else
+        BOOT_LIMITE="${BOOT_LIMITE:+$BOOT_LIMITE; }este systemd-boot no anuncia 'One-shot entry control'"
+    fi
+fi
+
+# --- variables EFI --------------------------------------------------------
+# Armar una entrada de un solo uso es escribir LoaderEntryOneShot en efivarfs.
+# Si no esta montado o el firmware no deja, no hay nada que hacer y hay que
+# decirlo aqui y no a mitad de un apagado.
+BOOT_EFIVARS=/sys/firmware/efi/efivars
+if [ ! -d "$BOOT_EFIVARS" ]; then
+    BOOT_EFIVARS=''
+    BOOT_LIMITE="${BOOT_LIMITE:+$BOOT_LIMITE; }no hay efivarfs (¿arranque no-EFI?)"
+elif [ ! -w "$BOOT_EFIVARS" ]; then
+    # Sin root esto es lo normal; se deja dicho pero NO cuenta como limite: quien
+    # arma corre como root y el `-w` de aqui seria un falso negativo que dejaria
+    # la rama muerta en silencio.
+    BOOT_EFIVARS="$BOOT_EFIVARS"
+fi
+
+# --- Secure Boot, que es el limite de verdad ------------------------------
+# La aplicacion de apagado la compila y la firma el usuario, y con Secure Boot
+# activado el firmware solo carga imagenes firmadas por una clave que conozca. Si
+# no esta firmada, systemd-boot no la carga, se vuelve al menu y arranca la
+# entrada por defecto: fallo benigno, pero el ahorro se pierde. Se detecta para
+# poder avisar ANTES (en la instalacion) y no durante un apagado.
+if [ -n "$BOOT_BOOTCTL" ] && "$BOOT_BOOTCTL" status 2>/dev/null | grep -q 'Secure Boot: enabled'; then
+    BOOT_SB=si
+fi
+
+# --- las dos piezas en la ESP --------------------------------------------
+if [ -n "$BOOT_ENTRIES" ]; then
+    BOOT_HALT_ENTRY="$BOOT_ENTRIES/$BOOT_HALT_ID.conf"
+elif [ -n "$BOOT_ESP" ]; then
+    BOOT_HALT_ENTRY="$BOOT_ESP/loader/entries/$BOOT_HALT_ID.conf"
+else
+    BOOT_HALT_ENTRY=''
+fi
+if [ -n "$BOOT_ESP" ]; then
+    BOOT_HALT_EFI="$BOOT_ESP/EFI/s5-halt/s5-halt.efi"
+else
+    BOOT_HALT_EFI=''
+fi
+
+if [ -n "$BOOT_LIMITE" ]; then
+    BOOT_ONESHOT=''
+fi
+
+# Ejecutado en vez de sourceado: informe para comprobar antes de instalar.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    printf 'ESP                : %s\n' "${BOOT_ESP:-(no encontrada)}"
+    printf 'bootctl            : %s\n' "${BOOT_BOOTCTL:-(no encontrado)}"
+    printf 'entrada de 1 uso   : %s\n' "${BOOT_ONESHOT:-NO}"
+    printf 'efivarfs           : %s\n' "${BOOT_EFIVARS:-NO}"
+    printf 'Secure Boot        : %s\n' "${BOOT_SB:-(desactivado o desconocido)}"
+    printf 'entrada            : %s%s\n' "${BOOT_HALT_ENTRY:-(sin ESP)}" \
+        "$([ -n "$BOOT_HALT_ENTRY" ] && [ -e "$BOOT_HALT_ENTRY" ] && echo '  (ya escrita)' || echo '  (falta)')"
+    printf 'aplicacion EFI     : %s%s\n' "${BOOT_HALT_EFI:-(sin ESP)}" \
+        "$([ -n "$BOOT_HALT_EFI" ] && [ -e "$BOOT_HALT_EFI" ] && echo '  (ya instalada)' || echo '  (falta)')"
+    if [ -n "$BOOT_LIMITE" ]; then
+        echo
+        echo "NO SE PUEDE USAR: $BOOT_LIMITE"
+        exit 1
+    fi
+    echo
+    echo 'Se puede usar: la politica puede enrutar el caso raro por aqui.'
+fi

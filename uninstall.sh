@@ -85,6 +85,39 @@ systemctl daemon-reload
 # no quedaba NADIE que pudiera barrerla: el equipo se apagaba solo nada mas
 # encenderlo. Es exactamente el accidente que este bloque existe para evitar, y
 # se le escapaba por la rama de las herramientas.
+echo "== barriendo residuos de la rama de systemd-boot"
+# La entrada y la aplicacion viven en la ESP; el armado, en una variable EFI. Se
+# pregunta a bootctl donde esta la ESP y, si no esta, se prueba la lista de
+# siempre: es una desinstalacion y barrer de mas no duele.
+esp_list="${S5_ESP_DIRS:-}"
+if command -v bootctl >/dev/null 2>&1; then
+    p=$(bootctl --print-esp-path 2>/dev/null) && esp_list="$p ${esp_list:-/boot /efi /boot/efi}"
+fi
+[ -n "$esp_list" ] || esp_list="/boot /efi /boot/efi"
+for esp in $esp_list; do
+    [ -d "$esp" ] || continue
+    if [ -e "$esp/EFI/s5-halt/s5-halt.efi" ] || [ -e "$esp/loader/entries/s5-halt.conf" ]; then
+        rm -f "$esp/loader/entries/s5-halt.conf" "$esp/EFI/s5-halt/s5-halt.efi"
+        rmdir "$esp/EFI/s5-halt" 2>/dev/null || true
+        echo "   entrada y aplicacion retiradas de $esp"
+    fi
+done
+# Y si quedo ARMADA, desarmarla: si no, el proximo apagado reiniciaria para
+# arrancar una aplicacion que ya no esta (seguiria el menu, pero es un POST
+# regalado y un susto). OJO: las variables EFI son INMUTABLES (----i---- en
+# lsattr) y `rm` a secas falla con EPERM; hay que quitarles el atributo antes,
+# que es lo que hace bootctl por dentro.
+for v in /sys/firmware/efi/efivars/LoaderEntryOneShot-*; do
+    [ -e "$v" ] || continue
+    [ "$(tr -d '\0' <"$v" 2>/dev/null)" = s5-halt ] || continue
+    chattr -i "$v" 2>/dev/null || true
+    if rm -f "$v" 2>/dev/null; then
+        echo "   armado de un solo uso desarmado (apuntaba a s5-halt)"
+    else
+        echo "   !! no pude desarmar $v: quitale el atributo con 'chattr -i' y borralo" >&2
+    fi
+done
+
 echo "== barriendo residuos de la rama de GRUB"
 # el sabor de GRUB: puede que el descubridor ya no este (se borra arriba), asi
 # que se prueban los dos a pelo. Es una desinstalacion: barrer de mas no duele.

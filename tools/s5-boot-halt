@@ -1,0 +1,191 @@
+#!/bin/bash
+# s5-boot-halt — el equivalente del `halt` de GRUB en una maquina con
+# systemd-boot: compila e instala la aplicacion EFI de apagado, y arma la entrada
+# de un solo uso para el proximo apagado.
+#
+# POR QUE EXISTE. La rama del caso raro de s5-gpu-politica apaga desde GRUB
+# porque en ese arranque no llega a ejecutarse un kernel de Linux: el firmware
+# hace su S5 con el hardware tal y como lo dejo el POST, y la medida sale limpia
+# (1,05 W medidos el 2026-08-09). Aqui no hay GRUB, asi que el mismo truco se hace
+# con una entrada de un solo uso que arranca system/efi/s5-halt.c. El porque de
+# que NO valga hacerlo desde un kernel vivo esta en docs/EVIDENCE.md
+# (`efi-poweroff` 19,26 W; `pm1a-acpica` 26,56 W): lo que salva la medida no es
+# apagar por el firmware, es que no haya kernel.
+#
+# Uso:
+#   sudo s5-boot-halt estado      (por defecto) que hay y si esta armado
+#   sudo s5-boot-halt instalar    compila, firma e instala app + entrada en la ESP
+#   sudo s5-boot-halt armar       deja la entrada de un solo uso para el proximo apagado
+#   sudo s5-boot-halt abortar     la quita (por si te arrepientes antes de apagar)
+#
+# FALLO SEGURO, SIEMPRE. Todo lo que falte se dice con nombre y apellido y la
+# orden no se lleva a cabo: sin gnu-efi no se compila, sin firma no se instala con
+# Secure Boot activado, sin efivarfs no se arma. En todos esos casos el apagado
+# sigue por el camino normal y solo se pierde el ahorro.
+#
+# NO TOCA NINGUN ARRANQUE QUE YA EXISTA: anade una entrada nueva a la ESP y una
+# variable EFI; no cambia el cargador, ni el kernel, ni ninguna entrada previa.
+# `abortar` y el uninstall.sh lo dejan como estaba.
+
+set -u
+
+HERE=$(cd "$(dirname "$0")/.." && pwd)
+S5_CONF=${S5_CONF:-/etc/s5-poweroff-fix.conf}
+LOG=${S5_BOOT_LOG:-/var/log/s5-shutdown-pci.log}
+# shellcheck source=/dev/null
+. "$HERE/system/bin/s5-descubre-boot" 2>/dev/null || {
+    # Si el descubridor no esta donde se le espera, se busca en su sitio de
+    # instalacion: el modulo y la politica ya viven en /usr/local/bin.
+    # shellcheck source=/dev/null
+    . /usr/local/bin/s5-descubre-boot
+}
+
+say() { printf 'BOOT  %s\n' "$*"; printf 'BOOT  %s\n' "$*" >>"$LOG" 2>/dev/null || true; }
+
+exigir_root() {
+    [ "$(id -u)" = 0 ] || { echo "error: esta orden escribe en la ESP y en efivarfs; usa sudo" >&2; exit 1; }
+}
+
+# Un limite del descubridor no siempre es un limite para ESTA orden: sin la
+# aplicacion instalada, `armar` no sirve pero `instalar` si. Se comprueba aparte.
+limite_para() {   # $1 = lo que se quiere hacer
+    case "$1" in
+    instalar) [ -n "$BOOT_ESP" ] && [ -n "$BOOT_BOOTCTL" ] ;;
+    armar)    [ -n "$BOOT_ESP" ] && [ -n "$BOOT_BOOTCTL" ] && [ "$BOOT_ONESHOT" = si ] \
+                  && [ -n "$BOOT_EFIVARS" ] && [ -e "$BOOT_HALT_ENTRY" ] && [ -e "$BOOT_HALT_EFI" ] ;;
+    esac
+}
+
+estado() {
+    printf 'ESP            : %s\n' "${BOOT_ESP:-(no encontrada)}"
+    printf 'bootctl        : %s\n' "${BOOT_BOOTCTL:-(no encontrado)}"
+    printf 'entrada 1 uso  : %s\n' "${BOOT_ONESHOT:-NO}"
+    printf 'Secure Boot    : %s\n' "${BOOT_SB:-(desactivado o desconocido)}"
+    printf 'aplicacion     : %s%s\n' "${BOOT_HALT_EFI:-(sin ESP)}" \
+        "$([ -n "$BOOT_HALT_EFI" ] && [ -e "$BOOT_HALT_EFI" ] && echo '  (instalada)' || echo '  (falta: s5-boot-halt instalar)')"
+    printf 'entrada        : %s%s\n' "${BOOT_HALT_ENTRY:-(sin ESP)}" \
+        "$([ -n "$BOOT_HALT_ENTRY" ] && [ -e "$BOOT_HALT_ENTRY" ] && echo '  (escrita)' || echo '  (falta: s5-boot-halt instalar)')"
+
+    # El armado se lee de la variable, no de un fichero de estado nuestro: la
+    # unica verdad es la que va a leer systemd-boot al arrancar.
+    v=$(ls -1 "$BOOT_EFIVARS"/LoaderEntryOneShot-* 2>/dev/null | head -1)
+    if [ -n "${v:-}" ]; then
+        printf 'armado         : SI (%s)\n' "$(tr -d '\0' <"$v" 2>/dev/null)"
+    else
+        printf 'armado         : no\n'
+    fi
+    if [ -n "$BOOT_LIMITE" ]; then
+        printf 'limite         : %s\n' "$BOOT_LIMITE"
+    fi
+}
+
+instalar() {
+    exigir_root
+    if ! limite_para instalar; then
+        echo "no puedo instalar todavia: ${BOOT_LIMITE:-falta la ESP o bootctl}" >&2
+        return 1
+    fi
+
+    echo "== 1. compilar =="
+    make -C "$HERE/system/efi" check || return 1     # ya dice que via hay en esta maquina
+    via=gnu-efi
+    if ! make -C "$HERE/system/efi"; then
+        # El binutils de algunas distribuciones no trae el objetivo efi-app-x86_64
+        # y la via de gnu-efi no puede hacer el ultimo paso. El mismo fuente se
+        # compila con clang + lld-link.
+        echo "la via gnu-efi no salio; probando clang + lld-link"
+        via=clang
+        make -C "$HERE/system/efi" clang || return 1
+    fi
+    echo "compilado por la via: $via"
+
+    echo
+    echo "== 2. firmar (solo si hace falta) =="
+    efi="$HERE/system/efi/s5-halt.efi"
+    if [ "$BOOT_SB" = si ]; then
+        # La aplicacion la firma el usuario con SUS claves: este proyecto no
+        # instala claves ni toca la base de datos de Secure Boot.
+        if command -v sbctl >/dev/null 2>&1; then
+            sbctl sign -s "$efi" || { echo "sbctl sign fallo" >&2; return 1; }
+        elif command -v sbsign >/dev/null 2>&1; then
+            echo "sbsign encontrado, pero hacen falta las claves del usuario:" >&2
+            echo "  sbsign --key /ruta/db.key --cert /ruta/db.crt --output <efi> <efi>" >&2
+            echo "y volver a ejecutar 's5-boot-halt instalar'." >&2
+            return 1
+        else
+            echo "Secure Boot activado y no hay ni sbctl ni sbsign: firmala a mano" >&2
+            return 1
+        fi
+    else
+        echo "Secure Boot desactivado: no hace falta firmar"
+    fi
+    # La comprobacion que de verdad importa, con la herramienta que lo sabe:
+    if command -v sbctl >/dev/null 2>&1; then
+        sbctl verify "$efi" 2>/dev/null | sed 's/^/  /' || true
+    fi
+
+    echo
+    echo "== 3. instalar en la ESP (nada existente se toca) =="
+    install -d -m755 "$(dirname "$BOOT_HALT_EFI")" || return 1
+    install -m644 "$efi" "$BOOT_HALT_EFI" || return 1
+
+    # La entrada se escribe UNA vez y se queda: asi armar un apagado es solo
+    # escribir una variable EFI, sin montar /boot ni escribir en la ESP durante
+    # la ventana de apagado (que es justo el problema que tiene la rama de GRUB).
+    cat >"$BOOT_HALT_ENTRY" <<'EOF'
+# s5-boot-halt — entrada de un solo uso, la arma `s5-boot-halt armar` y la
+# consume systemd-boot. NO se borra al usarla: sin la variable LoaderEntryOneShot
+# es una entrada mas del menu, y la barrera de verdad contra un bucle es que la
+# aplicacion borra esa variable antes de apagar.
+title   S5 — apagar desde el firmware (la dGPU no se durmio)
+efi     /EFI/s5-halt/s5-halt.efi
+EOF
+    chmod 0644 "$BOOT_HALT_ENTRY" 2>/dev/null || true
+    sync
+    say "instalado: $BOOT_HALT_EFI + $BOOT_HALT_ENTRY (Secure Boot=$BOOT_SB)"
+    echo
+    echo "instalado. Ahora: s5-boot-halt armar   (y apagar para probarlo)"
+}
+
+armar() {
+    exigir_root
+    # El armado vive en system/bin/s5-politica-boot, que es lo que llama la
+    # politica durante el apagado: UNA sola implementacion, y esta orden solo la
+    # usa para ensayar (--armar-solo = arma y NO reinicia).
+    if [ ! -x "$HERE/system/bin/s5-politica-boot" ]; then
+        echo "no encuentro $HERE/system/bin/s5-politica-boot" >&2
+        return 1
+    fi
+    S5_POLITICA_LOG="$LOG" S5_DESCUBRE_BOOT="$HERE/system/bin/s5-descubre-boot" \
+        "$HERE/system/bin/s5-politica-boot" --armar-solo
+}
+
+abortar() {
+    exigir_root
+    v=$(ls -1 "$BOOT_EFIVARS"/LoaderEntryOneShot-* 2>/dev/null | head -1)
+    if [ -z "${v:-}" ]; then
+        echo "no habia nada armado"
+        return 0
+    fi
+    # `bootctl set-oneshot ''` no vale para borrar en todas las versiones, y `rm`
+    # a secas TAMPOCO: las variables EFI son inmutables (----i---- en lsattr) y el
+    # kernel devuelve EPERM. Hay que quitarles el atributo primero, que es lo que
+    # hace bootctl por dentro.
+    chattr -i "$v" 2>/dev/null || true
+    rm -f "$v" 2>/dev/null || true
+    if [ -e "$v" ]; then
+        echo "no pude borrar $v (¿sin permisos? prueba: sudo chattr -i $v && sudo rm -f $v)" >&2
+        return 1
+    fi
+    sync
+    say "DESARMADO: variable LoaderEntryOneShot borrada"
+    echo "desarmado"
+}
+
+case "${1:-estado}" in
+estado)   estado ;;
+instalar) instalar ;;
+armar)    armar ;;
+abortar)  abortar ;;
+*)        sed -n '13,18p' "$0" | sed 's/^# \{0,1\}//' ;;
+esac

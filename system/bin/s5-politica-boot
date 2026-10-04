@@ -1,0 +1,124 @@
+#!/bin/bash
+# s5-politica-boot — la rama del CASO RARO cuando no hay GRUB: systemd-boot.
+#
+# QUE HACE, en orden:
+#   1. descubrir (s5-descubre-boot) y, si falta algo, decirlo y salir SIN tocar nada
+#   2. armar la entrada de un solo uso (una variable EFI) y VERIFICARLA
+#   3. reiniciar para que systemd-boot arranque s5-halt.efi, que apaga desde el
+#      firmware sin que llegue a ejecutarse un kernel
+#
+# Uso:
+#   s5-politica-boot              arma y reinicia (lo llama s5-gpu-politica)
+#   s5-politica-boot --armar-solo arma y NO reinicia (ensayo: deja el armado puesto)
+#   S5_POLITICA_DRYRUN=1 ...      no escribe nada, solo dice lo que haria
+#
+# POR QUE EXISTE. La rama de GRUB apaga con `halt` porque en ese arranque no llega
+# a ejecutarse un kernel de Linux: el firmware hace su S5 con el hardware tal y
+# como lo dejo el POST, y la medida sale limpia (`grub-halt`, 1,05 W, 2026-08-09).
+# En una maquina con systemd-boot no hay `halt`, y hacerlo desde un kernel vivo NO
+# es equivalente — medido y en docs/EVIDENCE.md: un modulo que llama a ResetSystem
+# por EFI deja el S5 en 19,26 W, y escribir PM1a_CNT sin `_PTS(5)` ni
+# `device_shutdown()` lo deja en 26,56 W. El mecanismo entero esta en
+# docs/systemd-boot-halt.md.
+#
+# VENTAJA SOBRE LA RAMA DE GRUB, y no es pequena: aqui NO hace falta montar /boot.
+# Los montajes mueren antes de `shutdown.target` (medido el 2026-08-11: boot.mount
+# se desmonta 100 ms ANTES de que se alcance shutdown.target), asi que la rama de
+# GRUB tiene que montarlo ella misma para escribir su custom.cfg. Aqui la entrada
+# esta escrita desde la instalacion y armar es solo escribir una variable EFI, que
+# vive en efivarfs y sigue montada. Menos cosas que pueden fallar en la ventana
+# mas delicada del apagado.
+#
+# FALLO SEGURO, SIEMPRE, y con la misma doctrina que la politica: si el
+# descubridor encuentra un limite, si la variable no queda escrita, si el
+# reinicio no da la vuelta — se registra, se dice, y el apagado sigue su curso
+# normal. Se pierde el ahorro; no se rompe el apagado.
+#
+# ANTI-BUCLE. La entrada es de un solo uso (la variable la consume systemd-boot) y
+# ademas s5-halt.efi BORRA esa variable antes de apagar: aunque el firmware no
+# llegara a apagarse, el arranque siguiente es el normal. La entrada se queda
+# escrita a proposito y la barre el uninstall.sh.
+
+set -u
+
+BIN=${S5_BIN:-/usr/local/bin}
+DESCUBRE=${S5_DESCUBRE_BOOT:-$BIN/s5-descubre-boot}
+LOG=${S5_POLITICA_LOG:-/var/log/s5-shutdown-pci.log}
+DRYRUN=${S5_POLITICA_DRYRUN:-0}
+FRENO=${S5_FRENO:-/var/lib/s5-test/gpu-politica-disabled}
+SOLO_ARMAR=0
+[ "${1:-}" = "--armar-solo" ] && SOLO_ARMAR=1
+
+# El log vive en / (btrfs) y en esta ventana / sigue en rw, pero todo va con
+# `|| true` por la misma razon que en la politica: un fallo de escritura no puede
+# matar el script.
+say() { printf 'POLITICA-BOOT %s\n' "$*"; printf 'POLITICA-BOOT %s\n' "$*" >>"$LOG" 2>/dev/null || true; }
+
+# Mismo freno de mano que la politica y que el hook 99y: si esta puesto, no se
+# toca nada y se dice.
+if [ -e "$FRENO" ]; then
+    say "FRENO: existe $FRENO => no se arma la salida por firmware; apagado normal"
+    exit 1
+fi
+
+# shellcheck source=/dev/null
+if [ -r "$DESCUBRE" ]; then
+    . "$DESCUBRE"
+else
+    say "falta $DESCUBRE (lo instala install.sh) => no se puede enrutar por systemd-boot"
+    exit 1
+fi
+
+say "sondeo: ESP=${BOOT_ESP:-?} bootctl=${BOOT_BOOTCTL:-?} entrada_1uso=${BOOT_ONESHOT:-NO} efivarfs=${BOOT_EFIVARS:-NO} secureboot=${BOOT_SB:-no}"
+if [ -n "$BOOT_LIMITE" ]; then
+    say "NO SE PUEDE: $BOOT_LIMITE"
+    exit 1
+fi
+if [ "$BOOT_ONESHOT" != si ] || [ -z "$BOOT_EFIVARS" ]; then
+    say "NO SE PUEDE: hace falta una entrada de un solo uso y efivarfs"
+    exit 1
+fi
+if [ ! -e "$BOOT_HALT_EFI" ] || [ ! -e "$BOOT_HALT_ENTRY" ]; then
+    say "NO SE PUEDE: falta la aplicacion o la entrada en la ESP (sudo $BIN/s5-boot-halt instalar)"
+    exit 1
+fi
+
+if [ "$DRYRUN" = 1 ]; then
+    say "DRYRUN: aqui haria '$BOOT_BOOTCTL set-oneshot $BOOT_HALT_ID' y reiniciaria"
+    say "DRYRUN: la via de systemd-boot HABRIA actuado (efectivo=$([ "$SOLO_ARMAR" = 1 ] && echo no || echo si))"
+    exit 0
+fi
+
+# --- 1. armar ---------------------------------------------------------------
+"$BOOT_BOOTCTL" set-oneshot "$BOOT_HALT_ID" >/dev/null 2>&1
+rc=$?
+if [ "$rc" != 0 ]; then
+    say "ARMAR FALLO: '$BOOT_BOOTCTL set-oneshot $BOOT_HALT_ID' rc=$rc => apagado normal"
+    exit 1
+fi
+
+# La comprobacion que vale es leer la variable, no el rc de la herramienta: es lo
+# que va a leer systemd-boot al arrancar.
+v=$(ls -1 "$BOOT_EFIVARS"/LoaderEntryOneShot-* 2>/dev/null | head -1)
+if [ -z "${v:-}" ] || [ "$(tr -d '\0' <"$v" 2>/dev/null)" != "$BOOT_HALT_ID" ]; then
+    say "ARMAR FALLO: la variable EFI no quedo con '$BOOT_HALT_ID' => apagado normal"
+    exit 1
+fi
+
+say "ARMADO: next_entry=$BOOT_HALT_ID (variable EFI verificada). El proximo arranque lo hace s5-halt.efi"
+[ "$SOLO_ARMAR" = 1 ] && exit 0
+
+# --- 2. reiniciar -----------------------------------------------------------
+# Mismo camino que la politica: `systemctl --force reboot` desmonta o remonta en
+# solo lectura, y si no da la vuelta se baja a mano lo que quede y se usa
+# `reboot -f`, que es la llamada al sistema pelada.
+sync
+say "reiniciando para que systemd-boot apague desde el firmware (veras un POST; es lo esperado)"
+systemctl --force reboot >/dev/null 2>&1
+
+sleep 3
+say "systemctl --force reboot no dio la vuelta; usando reboot -f"
+sync
+mount -o remount,ro / 2>/dev/null || true
+sync
+exec reboot -f

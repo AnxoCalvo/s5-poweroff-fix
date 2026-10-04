@@ -76,6 +76,20 @@ if [ "$rc_grub" != 0 ] && [ "$(id -u)" = 0 ]; then
     echo "   AVISO: la rama de GRUB se autodesactiva (falla segura: apaga normal). El resto del arreglo NO depende de ella."
 fi
 
+# LA OTRA VIA DEL CASO RARO, la de systemd-boot. Se ensena por el mismo motivo
+# que la de GRUB — no se adivina, se dice lo que hay — y con la misma doctrina:
+# que falte NO aborta la instalacion, solo deja el caso raro sin salvavidas.
+# OJO: que el descubridor salga bien NO significa que la via este lista; la
+# aplicacion EFI hay que compilarla, firmarla (si hay Secure Boot) e instalarla
+# aparte con `s5-boot-halt instalar`, y por eso se dice tambien eso.
+paso "Via de systemd-boot para el caso raro"
+salida_boot="$(bash system/bin/s5-descubre-boot 2>&1)"; rc_boot=$?
+printf '%s\n' "$salida_boot" | sed 's/^/   /'
+if [ "$rc_boot" = 0 ] && [ ! -e /boot/EFI/s5-halt/s5-halt.efi ]; then
+    echo "   NOTA: falta la aplicacion EFI; el caso raro seguira sin salvavidas hasta"
+    echo "         'sudo s5-boot-halt instalar' (necesita gnu-efi y, con Secure Boot, firmarla)."
+fi
+
 # --- 2. las piezas del arreglo ----------------------------------------------
 paso "Descubridor de dispositivos"
 pon 0755 system/bin/s5-descubre-dgpu "$BIN/s5-descubre-dgpu"
