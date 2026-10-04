@@ -3,7 +3,7 @@
 
 Name:           s5-pmrt-arm-kmod
 Version:        1.0
-Release:        4%{?dist}
+Release:        5%{?dist}
 Summary:        Mitigacion del drenaje en S5 causado por la dGPU en portatiles hibridos
 License:        GPL-2.0-only
 URL:            https://github.com/AnxoCalvo/s5-poweroff-fix
@@ -69,6 +69,23 @@ install -m 644 kernel/s5_pmrt_arm.c kernel/Makefile $RPM_BUILD_ROOT%{_datadir}/s
 %{_datadir}/s5-pmrt-arm/
 
 %changelog
+* Sun Oct 04 2026 december172 <george.december172@gmail.com> - 1.0-5
+- ESPERA_D3COLD pasa a TRES FASES (resolver / asentar / blindar) y arranca
+  DESACTIVADA (wait_ms=0). La 1.0-4 esperaba dentro del mismo bucle que blinda y,
+  con la lista que genera s5-descubre-dgpu (puente, GPU, audio), el plazo se lo
+  comia el puente: un puerto no puede dormir con un hijo despierto, y ademas
+  __pm_runtime_disable() sobre el puente lo deja despierto Y sin permiso para
+  suspenderse, con lo que la GPU ya no puede alcanzar D3cold. O sea que la 1.0-4
+  no solo no ayudaba en el caso raro: hacia imposible lo que venia a conseguir.
+  Ahora la fase B pide idle a todos y espera al CONJUNTO, la fase C blinda, y el
+  plazo sigue siendo uno solo para toda la lista (uno por dispositivo
+  multiplicaria la tardanza del peor apagado por el numero de BDF).
+- Por defecto 0 y no 5000: en el flujo de esta casa la politica ya espero 90 s y
+  el gancho 20 s mas antes de que el modulo cargue, asi que la espera no tiene
+  nada que ganar y si 5 s que perder en el caso raro. Se enciende con
+  `wait_ms=<ms>`, por ejemplo desde el fichero de override de parametros.
+- El testigo (`ESPERA_D3COLD ...`) sigue en linea propia, fuera de la linea FIN.
+
 * Sat Oct 03 2026 december172 <george.december172@gmail.com> - 1.0-4
 - ESPERA_D3COLD: antes de blindar, si el dispositivo no esta en D3cold se le pide
   el idle al nucleo (pm_request_idle) y se sondea hasta que llegue o venza un
