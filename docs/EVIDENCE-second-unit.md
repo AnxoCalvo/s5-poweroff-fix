@@ -69,15 +69,37 @@ Two differences matter to this repository:
 | date | label | what changed | result | verdict |
 |---|---|---|---|---|
 | 10-03 | `clean-50min-1.3` | in-kernel shield armed with the dGPU **in `D0`**; the 5 s settle wait ran to its full budget and gave up | ≤1 Wh / 0.83 h ⇒ **≈1 W** (raw window 2.2 Wh, of which 1.2–2.9 Wh is the uptime inside it) | **CLEAN**, n=1 — a 50-minute window; not comparable to the nights above (rule 1). The raw witness record was trimmed by the log cap, so this row is quoted from the project's own README |
+| 10-04 | **`baseline-no-shield`** | in-kernel shield **removed** (`modprobe -r`), charger unplugged, 2.52 h window | **51.242 Wh / 2.52 h ⇒ 20.33 W** | **poisoned** — this unit's own "before", landing in the same 18.7–24 W class measured above on the reference machine |
 | 10-03 | `ac-on-void` | same configuration, charger connected throughout | refused by the gate at both ends | **VOID** — quoted only to show the refusal works |
+
+Appendix for `baseline-no-shield`, so every figure is recomputable from the witness log and
+`/var/lib/s5-shield/rows.tsv`:
+
+```
+window    : 2026-10-04T12:06:30+08:00 -> 14:37:42+08:00   (2.5200 h, 51.2420 Wh, 20.33 W)
+shutdown  : battery 61.258 Wh (78%), ac_online=0, uptime 8922 s
+            s5_shield: NOT loaded -> the poweroff will behave as before
+            energy_now=61258000 voltage_now=11462000 energy_full=78466000 capacity=78
+            state at entry: dGPU=D0 port=D0 audio=D3hot   (port ACPI=D0)
+boot      : battery 10.016 Wh (13%), ac_online=0, uptime 8 s
+            s5_shield: loaded, srcversion=5ABD41F6E01E06E371E5D2F wait_ms=0
+ledger    : 2026-10-04T14:37:42  2.5200 h  51.2420 Wh  20.33 W  FAIL  baseline-no-shield
+```
+
+Two notes on it, both computed and not worded: the window ended with ~10 Wh left, so it measured a
+**rate** and not a floor (had the battery been flat at boot, the tail would not have been drawing at
+that rate, and `bin/s5-evidence` now says so when it sees ≤ 10%); and the next boot's self-check
+**fired as designed** — `FAIL - BACKWARD`, the `check-failed` marker and a `FAIL` line in the ledger.
+That is the alarm working, not a fault: an unshielded poweroff is supposed to read like that.
 
 Planned, not yet measured (each is one poweroff and one window; the windows of a pair are the same
 length on purpose):
 
-* `baseline-no-shield` — shield removed, same window as the next row. This unit's **pre-fix drain has
-  never been measured**: the ~20 W is the measurement above, from another machine. Until this row
-  exists, nothing here may be compared against a "before".
-* `clean-night-1.4` — whole night with the shield armed, `wait_ms=0`.
+* `clean-window-1.4` — the **same 2.5 h window** as the baseline, shield armed, `wait_ms=0`. That pair
+  is what makes the comparison legal under rule 1. The pair cannot be a whole night here: unshielded, a
+  ~78 Wh battery lasts ~3–4 h, and past that the EC cuts and the tail is no longer drawing at that
+  rate, so the row would become a floor instead of a rate. A whole-night row, if taken, is a different
+  window and is labelled as such — rule 1.
 * `wait-5000-1.4` — screening windows, same length, to isolate the retired wait: same code, one
   parameter.
 
