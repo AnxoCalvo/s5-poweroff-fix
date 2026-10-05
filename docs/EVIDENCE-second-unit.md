@@ -23,17 +23,29 @@ The implementation, its tooling and its own evidence file live at
 
 Two differences matter to this repository:
 
-1. **The wait is not the lever, and `pm_request_idle()` cannot make it one.** Arming here happens in
-   `kernel_shutdown_prepare()`, i.e. one step *earlier* than the `99y` hook's `modprobe`, so the wait
-   this unit first shipped had even less room to help than the patch proposed for `s5_pmrt_arm` - and
-   the source says neither can help:
+1. **The wait is the lever here, and this unit measured it the hard way.** Arming here happens in
+   `kernel_shutdown_prepare()`, one step *earlier* than the `99y` hook's `modprobe`. Revision 1.3/1.4
+   shipped `wait_ms=0`, on the argument that the core lets the subtree go during `device_shutdown()`
+   and that a nudge cannot force a suspend. That argument is right about nudges, and it was wrong
+   about the wait:
    `rpm_check_suspend_allowed()` refuses a suspend with `-EACCES` (`disable_depth > 0`), `-EAGAIN`
    (`usage_count > 0`) or `-EBUSY` (`child_count > 0`, which is exactly the dGPU's root port while the
    GPU is awake); a device that *can* suspend has already been idle-notified by the core when its last
-   reference was dropped, so the nudge is a no-op there too; and when the request is accepted,
-   `rpm_suspend(RPM_AUTO)` waits out the device's autosuspend delay rather than suspending at once.
-   Measured on this unit: the wait ran its full 5000 ms with the dGPU still in `D0`, and the off
-   window that followed was still ~1 W. The wait has been retired here (`wait_ms=0`).
+   reference was dropped, so `pm_request_idle()` is a no-op there too; and when the request is
+   accepted, `rpm_suspend(RPM_AUTO)` waits out the device's autosuspend delay rather than suspending
+   at once. But arming is not a nudge: `__pm_runtime_disable()` takes the ability to suspend *away*,
+   and a port cannot suspend while a device below it is awake, so an awake subtree that gets armed
+   stays awake for the whole of S5. The wait is therefore not an attempt to force a suspend at arming
+   time - it is the last window in which the subtree is still allowed to suspend by itself.
+   Measured with one binary and one parameter (`srcversion 5ABD41F6E01E06E371E5D2F`, the same arm-time
+   state: dGPU `D0`, root port `D0`, audio `D3hot`, no holders): `wait_ms=0` drew **18.51 W** over
+   0.34 h (ledger `FAIL`, the boot check reporting *the rail was NOT cut*), while `wait_ms=20000` drew
+   **0.43 W** over 11.12 h (ledger `OK`). Revision **1.5 consequently ships `wait_ms=20000`**.
+   This does not contradict the closure of
+   [#2](https://github.com/AnxoCalvo/s5-poweroff-fix/pull/2): the reference policy waits up to 90 s
+   *before* its module is loaded, so a wait inside `s5_pmrt_arm` adds nothing there. Both statements
+   hold at once - on a unit with no policy layer, the wait is the only step that can settle the
+   subtree before arming forecloses it.
    A *userspace* nudge does exist for anyone who wants to time the drop on their own machine -
    writing `on` then `auto` to `power/control` is `pm_runtime_forbid()` + `pm_runtime_allow()`, i.e. a
    resume followed by an `rpm_idle()` - but it has the same ceiling, and it *wakes* whatever is asleep,
@@ -52,8 +64,11 @@ Two differences matter to this repository:
 * Both records carry the raw battery registers (`energy_now`, `charge_now`, `voltage_now`, …), so any
   published watt can be recomputed from the log instead of taken on trust.
 * A row is **refused**, not guessed, when the charger was connected at either end, the battery went
-  up, the boot sample was taken long after boot, the boot record is missing, the window is under
-  0.5 h, or the two independent computations of the same window disagree by more than 0.02 W.
+  up, the battery reads **exactly the same at both ends** (a gauge that stayed pinned, which is what
+  this unit's pack does when the window starts at 100% — it cost one 10.1 h window on 2026-10-06, and
+  the zero-delta gate was added because of it), the boot sample was taken long after boot, the boot
+  record is missing, the window is under 0.5 h, or the two independent computations of the same window
+  disagree by more than 0.02 W.
 * The witness log is capped, which already cost this unit the raw record of the row below; judgeable
   windows are now also appended, never trimmed, to `/var/lib/s5-shield/rows.tsv`.
 * Since revision 1.4 the module also prints, in the poweroff path, the runtime PM accounting and the
@@ -71,6 +86,20 @@ Two differences matter to this repository:
 | 10-03 | `clean-50min-1.3` | in-kernel shield armed with the dGPU **in `D0`**; the 5 s settle wait ran to its full budget and gave up | ≤1 Wh / 0.83 h ⇒ **≈1 W** (raw window 2.2 Wh, of which 1.2–2.9 Wh is the uptime inside it) | **CLEAN**, n=1 — a 50-minute window; not comparable to the nights above (rule 1). The raw witness record was trimmed by the log cap, so this row is quoted from the project's own README |
 | 10-04 | **`baseline-no-shield`** | in-kernel shield **removed** (`modprobe -r`), charger unplugged, 2.52 h window | **51.242 Wh / 2.52 h ⇒ 20.33 W** | **poisoned** — this unit's own "before", landing in the same 18.7–24 W class measured above on the reference machine |
 | 10-03 | `ac-on-void` | same configuration, charger connected throughout | refused by the gate at both ends | **VOID** — quoted only to show the refusal works |
+| 10-04 | `diag-1.4-no-wait` | revision 1.4 with `wait_ms=0`, shield armed with the dGPU in `D0` | 6.288 Wh / 0.34 h ⇒ **18.51 W** | **FAIL** — below the 0.5 h publication floor, so it is kept as a diagnostic and not as a row; the ledger keeps its `FAIL` line, and the boot check fired *the rail was NOT cut* |
+| 10-04/05 | `probe-wait-20s` | revision 1.4 with `wait_ms=20000` restored — the parameter 1.5 now defaults to | 4.771 Wh / 11.12 h ⇒ **0.43 W** (the boot itself is inside that) | **CLEAN**, n=1, ledger `OK` — not comparable to the 2.52 h baseline under rule 1; it *is* comparable to the reference machine's `nocturna-real` (0.46 W over 9.5 h) |
+| — | `clean-window-1.5` | revision 1.5, `wait_ms=20000` (the default), **the same 2.52 h window** as the baseline | *owed* | **pending** — the row that makes the before/after legal under rule 1 |
+
+Appendix for the two revision-1.4 windows, because they are the whole argument for the default:
+same module binary, same arm-time state, one parameter. Raw registers are in the witness log and in
+`/var/lib/s5-shield/rows.tsv` (never trimmed).
+
+```
+wait_ms=0       window 2026-10-04T23:03:51 -> 23:24:14   0.3397 h   6.2880 Wh   18.51 W  FAIL
+                dGPU D0, root port D0, audio D3hot, no holders at arming time
+wait_ms=20000   window 2026-10-04T23:37:10 -> 10-05T10:44:18  11.1189 h   4.7710 Wh   0.43 W  OK
+                same arm-time state; one parameter differs from the line above
+```
 
 Appendix for `baseline-no-shield`, so every figure is recomputable from the witness log and
 `/var/lib/s5-shield/rows.tsv`:
@@ -92,26 +121,31 @@ that rate, and `bin/s5-evidence` now says so when it sees ≤ 10%); and the next
 **fired as designed** — `FAIL - BACKWARD`, the `check-failed` marker and a `FAIL` line in the ledger.
 That is the alarm working, not a fault: an unshielded poweroff is supposed to read like that.
 
-Planned, not yet measured (each is one poweroff and one window; the windows of a pair are the same
-length on purpose):
+Owed, and only one window (one poweroff):
 
-* `clean-window-1.4` — the **same 2.5 h window** as the baseline, shield armed, `wait_ms=0`. That pair
-  is what makes the comparison legal under rule 1. The pair cannot be a whole night here: unshielded, a
-  ~78 Wh battery lasts ~3–4 h, and past that the EC cuts and the tail is no longer drawing at that
+* `clean-window-1.5` — the **same 2.52 h window** as `baseline-no-shield`, shield 1.5 with its shipped
+  defaults (`wait_ms=20000`). That pair is what makes the comparison legal under rule 1; the A/B above
+  is a stronger result than a pair but it is not one. The pair cannot be a whole night here: unshielded,
+  a ~78 Wh battery lasts ~3–4 h, and past that the EC cuts and the tail is no longer drawing at that
   rate, so the row would become a floor instead of a rate. A whole-night row, if taken, is a different
   window and is labelled as such — rule 1.
-* `wait-5000-1.4` — screening windows, same length, to isolate the retired wait: same code, one
-  parameter.
+* `wait-5000-1.4` — **dropped**, and that is a decision, not an omission. Revision 1.3's 5 s budget ran
+  out with the dGPU still in `D0`, and the A/B above then showed that the interesting parameter is not
+  the *length* of the wait but its presence: `0` versus a budget long enough to settle. A screening
+  window at 5000 ms would say nothing the two rows above do not already say.
 
 ## Two findings worth writing down
 
-1. **`D0` at arming time is not the same thing as `D0` at the moment of no return.** On this unit the
-   dGPU *and* its root port were in `D0` when the shield armed (port `child_count=1`: the port cannot
-   suspend while the GPU under it is active), and the off window was still ~1 W. The `FINAL` observer
-   above exists to settle where the tree actually ends up; the first instrumented run will say whether
-   the walk releases it (expected: dGPU `D3cold`, bridge `D3hot`/`D3cold`) or whether something holds
-   it to the end. Either reading is a real result, and the second one would mean the rare case is not
-   as rare as the arming-time snapshot suggests.
+1. **`D0` at arming time is not the same thing as `D0` at the moment of no return — the wait decides
+   which one you get.** On this unit the dGPU *and* its root port were in `D0` when the shield armed
+   (port `child_count=1`: the port cannot suspend while the GPU under it is active). With no wait in
+   front of it that subtree was still `D0` after `device_shutdown()` and the rail stayed on (18.51 W);
+   with a wait, the same arming-time state ended in a released rail (0.43 W). The arming snapshot is
+   therefore not a prediction, and the `FINAL` observer is what closes the gap: it prints the state
+   *after* the walk, so the owed window is being taken with the console held open (`final_hold_ms`) to
+   photograph whether the dGPU ended in `D3cold` with the bridge out of `D0`, or whether something held
+   it to the end. Either reading is a real result, and the second would mean the rare case is not as
+   rare as the arming-time snapshot suggests.
 2. **`D0` per se is not the expensive state; a device that is genuinely in use is.** Upstream's
    `gpu-en-uso-v1` (19.38 W) is a GPU pinned awake and working; an idle `D0` device on this unit cost
    nothing measurable over 50 minutes. The two are worth separating in the policy: what the GRUB
