@@ -67,10 +67,11 @@ estado() {
         "$([ -n "$BOOT_HALT_ENTRY" ] && [ -e "$BOOT_HALT_ENTRY" ] && echo '  (escrita)' || echo '  (falta: s5-boot-halt instalar)')"
 
     # El armado se lee de la variable, no de un fichero de estado nuestro: la
-    # unica verdad es la que va a leer systemd-boot al arrancar.
+    # unica verdad es la que va a leer systemd-boot al arrancar. Los 4 primeros
+    # bytes son los atributos de la variable en efivarfs, no su contenido.
     v=$(ls -1 "$BOOT_EFIVARS"/LoaderEntryOneShot-* 2>/dev/null | head -1)
     if [ -n "${v:-}" ]; then
-        printf 'armado         : SI (%s)\n' "$(tr -d '\0' <"$v" 2>/dev/null)"
+        printf 'armado         : SI (%s)\n' "$(tail -c +5 <"$v" 2>/dev/null | tr -d '\0')"
     else
         printf 'armado         : no\n'
     fi

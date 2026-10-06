@@ -109,7 +109,10 @@ done
 # que es lo que hace bootctl por dentro.
 for v in /sys/firmware/efi/efivars/LoaderEntryOneShot-*; do
     [ -e "$v" ] || continue
-    [ "$(tr -d '\0' <"$v" 2>/dev/null)" = s5-halt ] || continue
+    # Los 4 primeros bytes son los atributos de la variable en efivarfs, no su
+    # contenido: sin saltarlos el valor leido es "\x07s5-halt" y esta condicion no
+    # se cumple nunca, asi que el desarmado se saltaba en silencio.
+    [ "$(tail -c +5 <"$v" 2>/dev/null | tr -d '\0')" = s5-halt ] || continue
     chattr -i "$v" 2>/dev/null || true
     if rm -f "$v" 2>/dev/null; then
         echo "   armado de un solo uso desarmado (apuntaba a s5-halt)"

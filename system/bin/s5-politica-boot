@@ -98,9 +98,12 @@ if [ "$rc" != 0 ]; then
 fi
 
 # La comprobacion que vale es leer la variable, no el rc de la herramienta: es lo
-# que va a leer systemd-boot al arrancar.
+# que va a leer systemd-boot al arrancar. efivarfs antepone 4 bytes de atributos a
+# cada variable, asi que el contenido empieza en el byte 5: sin saltarlos el valor
+# es "\x07s5-halt", la comparacion falla aunque el armado sea correcto, y esta via
+# se declara no disponible sin decir la verdad.
 v=$(ls -1 "$BOOT_EFIVARS"/LoaderEntryOneShot-* 2>/dev/null | head -1)
-if [ -z "${v:-}" ] || [ "$(tr -d '\0' <"$v" 2>/dev/null)" != "$BOOT_HALT_ID" ]; then
+if [ -z "${v:-}" ] || [ "$(tail -c +5 <"$v" 2>/dev/null | tr -d '\0')" != "$BOOT_HALT_ID" ]; then
     say "ARMAR FALLO: la variable EFI no quedo con '$BOOT_HALT_ID' => apagado normal"
     exit 1
 fi
