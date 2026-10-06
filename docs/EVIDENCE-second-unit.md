@@ -88,7 +88,7 @@ Two differences matter to this repository:
 | 10-03 | `ac-on-void` | same configuration, charger connected throughout | refused by the gate at both ends | **VOID** — quoted only to show the refusal works |
 | 10-04 | `diag-1.4-no-wait` | revision 1.4 with `wait_ms=0`, shield armed with the dGPU in `D0` | 6.288 Wh / 0.34 h ⇒ **18.51 W** | **FAIL** — below the 0.5 h publication floor, so it is kept as a diagnostic and not as a row; the ledger keeps its `FAIL` line, and the boot check fired *the rail was NOT cut* |
 | 10-04/05 | `probe-wait-20s` | revision 1.4 with `wait_ms=20000` restored — the parameter 1.5 now defaults to | 4.771 Wh / 11.12 h ⇒ **0.43 W** (the boot itself is inside that) | **CLEAN**, n=1, ledger `OK` — not comparable to the 2.52 h baseline under rule 1; it *is* comparable to the reference machine's `nocturna-real` (0.46 W over 9.5 h) |
-| — | `clean-window-1.5` | revision 1.5, `wait_ms=20000` (the default), **the same 2.52 h window** as the baseline | *owed* | **pending** — the row that makes the before/after legal under rule 1 |
+| 10-06 | **`clean-window-1.5`** | revision 1.5, `wait_ms=20000` (the shipped default); the baseline's window, 2.43 h against its 2.52 h — the shorter side, which reads *higher* for the same S5 | **1.0310 Wh / 2.4278 h ⇒ 0.42 W** | **CLEAN** — ledger `OK`. With `baseline-no-shield` this is the legal pair under rule 1: **20.33 W → 0.42 W**, same machine, same window, shield off against shield on |
 
 Appendix for the two revision-1.4 windows, because they are the whole argument for the default:
 same module binary, same arm-time state, one parameter. Raw registers are in the witness log and in
@@ -121,18 +121,29 @@ that rate, and `bin/s5-evidence` now says so when it sees ≤ 10%); and the next
 **fired as designed** — `FAIL - BACKWARD`, the `check-failed` marker and a `FAIL` line in the ledger.
 That is the alarm working, not a fault: an unshielded poweroff is supposed to read like that.
 
-Owed, and only one window (one poweroff):
+**The pair is now measured, and it is the headline**: `clean-window-1.5` — the baseline's own window
+with shield 1.5 at its shipped defaults — read **1.0310 Wh / 2.4278 h ⇒ 0.42 W**, against
+`baseline-no-shield`'s **51.2420 Wh / 2.5200 h ⇒ 20.33 W**. Same machine, same 2.5 h window (2.43 h
+against 2.52 h, and the shielded one is the shorter of the two, which for the same S5 reads *higher*,
+so the residual difference runs against the fix), shield off against shield on: **a 48× drop**, and
+this unit's first legal before/after under rule 1.
 
-* `clean-window-1.5` — the **same 2.52 h window** as `baseline-no-shield`, shield 1.5 with its shipped
-  defaults (`wait_ms=20000`). That pair is what makes the comparison legal under rule 1; the A/B above
-  is a stronger result than a pair but it is not one. The pair cannot be a whole night here: unshielded,
-  a ~78 Wh battery lasts ~3–4 h, and past that the EC cuts and the tail is no longer drawing at that
-  rate, so the row would become a floor instead of a rate. A whole-night row, if taken, is a different
-  window and is labelled as such — rule 1.
-* `wait-5000-1.4` — **dropped**, and that is a decision, not an omission. Revision 1.3's 5 s budget ran
-  out with the dGPU still in `D0`, and the A/B above then showed that the interesting parameter is not
-  the *length* of the wait but its presence: `0` versus a budget long enough to settle. A screening
-  window at 5000 ms would say nothing the two rows above do not already say.
+Why the pair cannot be a whole night here, and why that is a limit of the machine rather than a
+choice: unshielded, a ~78 Wh battery lasts ~3–4 h, and past that the EC cuts and the tail is no
+longer drawing at that rate, so the row would become a floor instead of a rate. A whole-night row, if
+taken, is a different window and is labelled as such — rule 1.
+
+Also for the record, one row that was refused rather than published: a 10.10 h overnight window on
+2026-10-06 read **0.00 W** because the pack started at 100% and the gauge stayed pinned at full
+(`energy_now` byte-identical at both ends while `voltage_now` moved 0.5 V). The rail was cut — a
+~20 W S5 would have flattened the pack in ~4 h and the machine booted after 10 — but the window had
+no measurement in it, so the tools now refuse a zero delta by name. It is filed as a diagnostic, not
+as a row.
+
+`wait-5000-1.4` — **dropped**, and that is a decision, not an omission. Revision 1.3's 5 s budget ran
+out with the dGPU still in `D0`, and the A/B above then showed that the interesting parameter is not
+the *length* of the wait but its presence: `0` versus a budget long enough to settle. A screening
+window at 5000 ms would say nothing the rows above do not already say.
 
 ## Two findings worth writing down
 
