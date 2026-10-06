@@ -219,32 +219,10 @@ if [ "$(pst $GPU)" = D3cold ]; then
     exit 0
 fi
 
-# --- 2. no cayo: enrutar por el cargador de arranque ------------------------
+# --- 2. no cayo: enrutar por GRUB -------------------------------------------
 say "POLITICA !!! la dGPU NO cayo a D3cold en ${t}s (traza: $traza)" \
     "POLITICA estado: $(estado)" \
-    "POLITICA => el apagado normal costaria ~19 W; hay que apagar sin que llegue a correr un kernel"
-
-# --- 2a. sin GRUB con el que desviar, la via de systemd-boot ----------------
-# Se decide AQUI y no despues de montar /boot: de nada sirve montarlo para
-# escribir un custom.cfg en una maquina que arranca con systemd-boot. Si la via
-# de systemd-boot esta y funciona, reinicia ella y esto termina; si no, se sigue
-# con la rama de GRUB de abajo, que no cambia una linea.
-#
-# Las dos vias hacen lo mismo por caminos distintos: apagar desde el firmware sin
-# que llegue a ejecutarse un kernel (GRUB con `halt`; systemd-boot con una entrada
-# de un solo uso y s5-halt.efi). El porque esta en docs/systemd-boot-halt.md.
-if [ -z "$GRUB_REBOOT" ] || [ -z "$GRUB_EDITENV" ]; then
-    POLITICA_BOOT=${S5_POLITICA_BOOT:-/usr/local/bin/s5-politica-boot}
-    say "POLITICA sin GRUB utilizable (reboot='${GRUB_REBOOT:-}' editenv='${GRUB_EDITENV:-}'): probando la via de systemd-boot"
-    if [ -x "$POLITICA_BOOT" ]; then
-        if S5_POLITICA_LOG="$LOG" "$POLITICA_BOOT"; then
-            exit 0        # reinicia dentro; el exit es por si volviera
-        fi
-        say "POLITICA la via de systemd-boot tampoco pudo; sigue el camino de siempre"
-    else
-        say "POLITICA falta $POLITICA_BOOT (lo instala install.sh): sigue el camino de siempre"
-    fi
-fi
+    "POLITICA => el apagado normal costaria ~19 W; enrutando por GRUB (halt, ~0,32 W)"
 
 BOOT_NUESTRO=0        # 1 si el montaje de /boot lo hemos hecho nosotros
 

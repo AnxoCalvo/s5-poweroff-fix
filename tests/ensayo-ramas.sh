@@ -1006,6 +1006,22 @@ cat > "$F/pol-descubre-sin-gpu" <<'EOF'
 EOF
 chmod +x "$F/pol-descubre-gpu" "$F/pol-descubre-sin-gpu"
 
+# LA RAMA DE SYSTEMD-BOOT SE DOBLA. La politica, cuando no hay GRUB utilizable,
+# llama a `s5-politica-boot` (la rama del caso raro en una maquina con
+# systemd-boot). En un ensayo eso seria el binario DE VERDAD en una maquina que
+# tenga la rama instalada —y un ensayo no llama a binarios de verdad, menos a uno
+# que arma entradas de arranque—. Se le da un doble que dice que no pudo, que es
+# justo el caso que estas pruebas miran: que la politica siga por donde seguia.
+# Un caso puede sobreescribirlo pasando S5_POLITICA_BOOT=... entre sus VAR=val,
+# porque van despues en la linea de `env`.
+cat > "$F/pol-politica-boot-doble" <<'EOF'
+#!/bin/sh
+echo "DOBLE s5-politica-boot: no puedo armar (esto es un ensayo)"
+exit 1
+EOF
+chmod +x "$F/pol-politica-boot-doble"
+POLITICA_BOOT_DOBLE="$F/pol-politica-boot-doble"
+
 politica_arma() {  # politica_arma <estado inicial de /boot: DESMONTADO|rw|ro>
     rm -rf "$F/pol"; mkdir -p "$F/pol"
     echo "$1" > "$F/pol/boot-state"
@@ -1015,6 +1031,7 @@ politica_corre() {  # politica_corre <PATH> <VAR=val>...
     politica_seguro "$ruta"
     env -i HOME="$HOME" PATH="$ruta" \
         S5_CONF=/dev/null S5_DESCUBRE_GRUB="$DGR" \
+        S5_POLITICA_BOOT="$POLITICA_BOOT_DOBLE" \
         S5_POLITICA_LOG="$F/pol/log" \
         POL_BOOTSTATE="$F/pol/boot-state" POL_MNTLOG="$F/pol/mount.log" \
         POL_SYSTEMCTLLOG="$F/pol/systemctl.log" POL_REBOOTLOG="$F/pol/reboot.log" \
