@@ -11,7 +11,7 @@ raw watts do not survive a change of window length.
 |  | reference machine (above) | this unit |
 |---|---|---|
 | board / firmware | HP OMEN 16-ap0xxx (`8E35`), BIOS F.13 | same model, same firmware |
-| CPU / dGPU | Ryzen 9 8945HX + RTX 5060 Max-Q | same |
+| CPU / dGPU | Ryzen 9 **8940HX** + RTX 5060 Max-Q | Ryzen 9 **8945HX** + RTX 5060 Max-Q — same model, different SKU |
 | distribution / kernel | Fedora, akmod | Arch Linux, `7.2.8-arch1-2` |
 | bootloader | GRUB2 | **systemd-boot** |
 | rare-case fallback | 90 s wait, then a one-shot GRUB `halt` (0.32 W) | **none** |
@@ -87,7 +87,7 @@ Two differences matter to this repository:
 | 10-04 | **`baseline-no-shield`** | in-kernel shield **removed** (`modprobe -r`), charger unplugged, 2.52 h window | **51.242 Wh / 2.52 h ⇒ 20.33 W** | **poisoned** — this unit's own "before", landing in the same 18.7–24 W class measured above on the reference machine |
 | 10-03 | `ac-on-void` | same configuration, charger connected throughout | refused by the gate at both ends | **VOID** — quoted only to show the refusal works |
 | 10-04 | `diag-1.4-no-wait` | revision 1.4 with `wait_ms=0`, shield armed with the dGPU in `D0` | 6.288 Wh / 0.34 h ⇒ **18.51 W** | **FAIL** — below the 0.5 h publication floor, so it is kept as a diagnostic and not as a row; the ledger keeps its `FAIL` line, and the boot check fired *the rail was NOT cut* |
-| 10-04/05 | `probe-wait-20s` | revision 1.4 with `wait_ms=20000` restored — the parameter 1.5 now defaults to | 4.771 Wh / 11.12 h ⇒ **0.43 W** (the boot itself is inside that) | **CLEAN**, n=1, ledger `OK` — not comparable to the 2.52 h baseline under rule 1; it *is* comparable to the reference machine's `nocturna-real` (0.46 W over 9.5 h) |
+| 10-04/05 | `probe-wait-20s` | revision 1.4 with `wait_ms=20000` restored — the parameter 1.5 now defaults to | 4.771 Wh / 11.12 h ⇒ **0.43 W** (the boot itself is inside that) | **CLEAN**, n=1, ledger `OK` — not comparable to the 2.52 h baseline under rule 1; it *is* comparable to the reference machine's `nocturna-real-v2` (0.46 W over 8.60 h), which is the closest of its nights to this window |
 | 10-06 | **`clean-window-1.5`** | revision 1.5, `wait_ms=20000` (the shipped default); the baseline's window, 2.43 h against its 2.52 h — the shorter side, which reads *higher* for the same S5 | **1.0310 Wh / 2.4278 h ⇒ 0.42 W** | **CLEAN** — ledger `OK`. With `baseline-no-shield` this is the legal pair under rule 1: **20.33 W → 0.42 W**, same machine, same window, shield off against shield on |
 
 Appendix for the two revision-1.4 windows, because they are the whole argument for the default:
@@ -145,7 +145,7 @@ out with the dGPU still in `D0`, and the A/B above then showed that the interest
 the *length* of the wait but its presence: `0` versus a budget long enough to settle. A screening
 window at 5000 ms would say nothing the rows above do not already say.
 
-## Two findings worth writing down
+## One finding, and one open question
 
 1. **`D0` at arming time is not the same thing as `D0` at the moment of no return — the wait decides
    which one you get.** On this unit the dGPU *and* its root port were in `D0` when the shield armed
@@ -168,8 +168,12 @@ window at 5000 ms would say nothing the rows above do not already say.
    no evidence the `POWER_OFF_PREPARE` observer was called at all. Either the display is already down
    when it is, or the handler is not reached on this path. The end state is therefore read from the
    arming block plus the window, not from a `FINAL` line.
-2. **`D0` per se is not the expensive state; a device that is genuinely in use is.** Upstream's
-   `gpu-en-uso-v1` (19.38 W) is a GPU pinned awake and working; an idle `D0` device on this unit cost
-   nothing measurable over 50 minutes. The two are worth separating in the policy: what the GRUB
-   branch protects against is not the state label but a GPU that cannot be let go of - and on a
-   systemd-boot machine there is no equivalent branch to fall back to yet.
+2. **An open question, not a finding: whether an idle `D0` costs anything.** The tempting reading —
+   that what costs ~19 W is a GPU *in use* rather than a GPU in `D0` — is not something this unit's
+   rows can carry. `gpu-en-uso-v1` (19.38 W over 0.34 h) was a dGPU pinned in `D0` with
+   `power/control=on` and deliberately **no load** running on it, so it separates "pinned" from
+   "working" not at all; and the only candidate for the opposite claim here, `clean-50min-1.3`, is a
+   50-minute window whose S5 share cannot be separated from the uptime inside it — the same reason it
+   is filed as a diagnostic rather than a row. It also sits awkwardly next to finding 1, where arming
+   in `D0` with no settle cost 18.51 W. Until there is a row that can carry it — a pinned dGPU over a
+   window long enough that the uptime does not dominate — this stays open.
