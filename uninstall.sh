@@ -121,6 +121,18 @@ for v in /sys/firmware/efi/efivars/LoaderEntryOneShot-*; do
     fi
 done
 
+# Y la marca que deja la aplicacion al ejecutarse (S5HaltLastRun, GUID propio):
+# se va con todo lo demas, no se queda de recuerdo en la NVRAM.
+for v in /sys/firmware/efi/efivars/S5HaltLastRun-*; do
+    [ -e "$v" ] || continue
+    chattr -i "$v" 2>/dev/null || true
+    if rm -f "$v" 2>/dev/null; then
+        echo "   marca de ejecucion borrada ($(basename "$v"))"
+    else
+        echo "   !! no pude borrar $v: quitale el atributo con 'chattr -i' y borralo" >&2
+    fi
+done
+
 echo "== barriendo residuos de la rama de GRUB"
 # el sabor de GRUB: puede que el descubridor ya no este (se borra arriba), asi
 # que se prueban los dos a pelo. Es una desinstalacion: barrer de mas no duele.

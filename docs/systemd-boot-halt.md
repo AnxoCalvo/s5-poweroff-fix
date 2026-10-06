@@ -62,6 +62,13 @@ mismo fuente se compila por las dos vias, que no estan disponibles en las mismas
   devuelve `EFI_SUCCESS` y `systemd-boot` sigue con su menu y su entrada por defecto. Se
   pierde el ahorro de ese apagado, no el arranque. Lo mismo con el descubridor: lo que falte
   se dice con nombre y apellido y la orden no se lleva a cabo.
+* **Se deja ver**: antes de apagar escribe la hora del firmware en una variable propia
+  (`S5HaltLastRun`). Hace falta porque un apagado desde el cargador **no deja log del
+  kernel** —ni journal, ni `dmesg`, ni el testigo—: sin esa marca, distinguir "la aplicacion
+  se ejecuto" de "el firmware reinicio y nadie se entero" depende de la memoria de quien
+  hizo el ensayo, y eso no es evidencia. `s5-boot-halt estado` la lee (`ultimo apagado :
+  SI, por firmware, el 2026-10-06 13:37:35`), `armar` la borra para que lo que se lea sea de
+  ese ensayo, y `uninstall.sh` se la lleva.
 * **No toca nada que ya exista**: anade una entrada nueva y una variable EFI. No cambia el
   cargador, ni el kernel, ni las entradas previas. `uninstall.sh` y `s5-boot-halt abortar`
   lo dejan como estaba.

@@ -56,6 +56,25 @@ limite_para() {   # $1 = lo que se quiere hacer
     esac
 }
 
+# La marca que deja la aplicacion al ejecutarse (ver system/efi/s5-halt.c). El
+# nombre en efivarfs lleva el GUID propio; los 4 primeros bytes del fichero son los
+# atributos de la variable, no su contenido.
+MARCA_NOMBRE=S5HaltLastRun
+MARCA_GUID=8b8c1b5e-2f1a-4b3c-9a7d-512c6e0a3f11
+marca_path() { printf '%s/%s-%s' "$BOOT_EFIVARS" "$MARCA_NOMBRE" "$MARCA_GUID"; }
+marca_valor() {
+    local v; v=$(marca_path)
+    [ -e "$v" ] || return 1
+    tail -c +5 <"$v" 2>/dev/null | tr -d '\0'
+}
+# Las variables EFI son inmutables (----i----); hay que quitarles el atributo antes
+# de borrarlas, que es lo que hace bootctl por dentro.
+borrar_var() {
+    [ -e "$1" ] || return 0
+    chattr -i "$1" 2>/dev/null || true
+    rm -f "$1" 2>/dev/null || true
+}
+
 estado() {
     printf 'ESP            : %s\n' "${BOOT_ESP:-(no encontrada)}"
     printf 'bootctl        : %s\n' "${BOOT_BOOTCTL:-(no encontrado)}"
@@ -77,6 +96,14 @@ estado() {
     fi
     if [ -n "$BOOT_LIMITE" ]; then
         printf 'limite         : %s\n' "$BOOT_LIMITE"
+    fi
+
+    # La prueba de que la aplicacion SE EJECUTO. No hay otra: el apagado ocurre
+    # sin kernel, asi que ni journal ni dmesg ni el testigo lo ven.
+    if marca=$(marca_valor); then
+        printf 'ultimo apagado : SI, por firmware, el %s\n' "$marca"
+    else
+        printf 'ultimo apagado : no consta que la aplicacion se haya ejecutado nunca\n'
     fi
 }
 
@@ -162,6 +189,9 @@ EOF
 
 armar() {
     exigir_root
+    # La marca del ensayo ANTERIOR se borra aqui: asi lo que se lea despues es de
+    # este, y no hay que fiarse de cuando se corrio por ultima vez.
+    borrar_var "$(marca_path)"
     # El armado vive en system/bin/s5-politica-boot, que es lo que llama la
     # politica durante el apagado: UNA sola implementacion, y esta orden solo la
     # usa para ensayar (--armar-solo = arma y NO reinicia).

@@ -48,6 +48,12 @@
  * sbctl si las claves del usuario estan donde se esperan). Sin firmar,
  * systemd-boot no la carga, se queda en el menu y arranca lo de siempre: no rompe
  * nada, pero tampoco ahorra — por eso la instalacion lo comprueba y lo avisa.
+ *
+ * SE DEJA VER. Antes de apagar escribe en `S5HaltLastRun` (GUID propio) la hora
+ * del firmware: un apagado desde el cargador no deja log del kernel, asi que sin
+ * esa marca no hay forma de distinguir "la aplicacion se ejecuto" de "el firmware
+ * reinicio y nadie se entero". `s5-boot-halt estado` la lee y `armar` la borra,
+ * de modo que lo que se lee es de ESTE ensayo.
  */
 
 #include <efi.h>
@@ -59,6 +65,13 @@ static EFI_GUID loader_guid = {
 	{ 0xb6, 0xc7, 0x44, 0x0b, 0x29, 0xbb, 0x8c, 0x4f }
 };
 
+/* GUID propio para la marca de ejecucion. En efivarfs la variable aparece como
+ * S5HaltLastRun-8b8c1b5e-2f1a-4b3c-9a7d-512c6e0a3f11 */
+static EFI_GUID s5_guid = {
+	0x8b8c1b5e, 0x2f1a, 0x4b3c,
+	{ 0x9a, 0x7d, 0x51, 0x2c, 0x6e, 0x0a, 0x3f, 0x11 }
+};
+
 /*
  * Un Print() propio en vez del de libefi: se llama al servicio de consola de la
  * tabla de sistema, que es lo unico que hace falta. Si no hubiera consola, se
@@ -68,6 +81,63 @@ static void decir(EFI_SYSTEM_TABLE *st, CHAR16 *texto)
 {
 	if (st && st->ConOut && st->ConOut->OutputString)
 		st->ConOut->OutputString(st->ConOut, texto);
+}
+
+/*
+ * MARCA DE EJECUCION. Un apagado desde el cargador no deja NINGUN log del kernel:
+ * ni journal, ni dmesg, ni el testigo. Sin algo escrito desde aqui, saber si el
+ * ensayo paso depende de la memoria de quien lo hizo, y eso no vale como
+ * evidencia. Se deja la hora del firmware en una variable propia; la lee
+ * `s5-boot-halt estado` y la borra `armar`, de modo que su contenido habla del
+ * ultimo ensayo y no de uno cualquiera.
+ *
+ * NO ES CRITICO: si esto falla se avisa por consola y el apagado sigue.
+ */
+static EFI_STATUS marcar(EFI_SYSTEM_TABLE *st)
+{
+	static const char dig[] = "0123456789";
+	EFI_TIME t;
+	CHAR16 buf[32];
+	char iso[24];
+	EFI_STATUS rc;
+	int i = 0, n;
+
+	if (!st->RuntimeServices || !st->RuntimeServices->GetTime)
+		return EFI_UNSUPPORTED;
+	if (EFI_ERROR(st->RuntimeServices->GetTime(&t, NULL)))
+		return EFI_UNSUPPORTED;
+
+#define DIG2(v) do { iso[i++] = dig[((v) / 10) % 10]; iso[i++] = dig[(v) % 10]; } while (0)
+	iso[i++] = dig[(t.Year / 1000) % 10];
+	iso[i++] = dig[(t.Year / 100) % 10];
+	DIG2(t.Year % 100);
+	iso[i++] = '-';
+	DIG2(t.Month);
+	iso[i++] = '-';
+	DIG2(t.Day);
+	iso[i++] = ' ';
+	DIG2(t.Hour);
+	iso[i++] = ':';
+	DIG2(t.Minute);
+	iso[i++] = ':';
+	DIG2(t.Second);
+#undef DIG2
+	iso[i] = '\0';
+
+	for (n = 0; n <= i; n++)
+		buf[n] = (CHAR16)iso[n];
+
+	rc = st->RuntimeServices->SetVariable(L"S5HaltLastRun", &s5_guid,
+					      EFI_VARIABLE_NON_VOLATILE |
+					      EFI_VARIABLE_BOOTSERVICE_ACCESS |
+					      EFI_VARIABLE_RUNTIME_ACCESS,
+					      (UINTN)(i + 1) * sizeof(CHAR16), buf);
+	if (!EFI_ERROR(rc)) {
+		decir(st, L"s5-halt: marca de ejecucion en S5HaltLastRun (");
+		decir(st, buf);
+		decir(st, L")\r\n");
+	}
+	return rc;
 }
 
 EFI_STATUS efi_main(EFI_HANDLE imagen, EFI_SYSTEM_TABLE *st)
@@ -91,6 +161,12 @@ EFI_STATUS efi_main(EFI_HANDLE imagen, EFI_SYSTEM_TABLE *st)
 					      0, 0, NULL);
 	if (EFI_ERROR(rc))
 		decir(st, L"s5-halt: aviso: no pude borrar LoaderEntryOneShot; si esto no apaga, el proximo arranque puede repetirlo\r\n");
+
+	/* La marca va despues del borrado: asi, si el apagado ocurre, lo que queda
+	 * escrito es "la aplicacion llego hasta aqui", no "alguien la armo". */
+	rc = marcar(st);
+	if (EFI_ERROR(rc))
+		decir(st, L"s5-halt: aviso: no pude dejar la marca de ejecucion (no afecta al apagado)\r\n");
 
 	if (!st->RuntimeServices->ResetSystem) {
 		decir(st, L"s5-halt: este firmware no ofrece ResetSystem; vuelvo al menu (arranque normal)\r\n");
