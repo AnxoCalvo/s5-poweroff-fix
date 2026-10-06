@@ -99,9 +99,24 @@ estado() {
     fi
 
     # La prueba de que la aplicacion SE EJECUTO. No hay otra: el apagado ocurre
-    # sin kernel, asi que ni journal ni dmesg ni el testigo lo ven.
+    # sin kernel, asi que ni journal ni dmesg ni el testigo lo ven. La hora va en
+    # UTC (la RTC de esta maquina va en UTC y el firmware la da tal cual), asi que
+    # se traduce a la local: leer "05:50" para un apagado de las 13:50 es justo el
+    # despiste que esto evita.
     if marca=$(marca_valor); then
-        printf 'ultimo apagado : SI, por firmware, el %s\n' "$marca"
+        # La aplicacion actual escribe la Z; la primera version no la ponia, y su
+        # hora era UTC igualmente (el firmware da UTC). Se normaliza aqui para que
+        # una marca vieja no se lea como si fuera local.
+        case "$marca" in
+        *Z) marca_utc=$marca ;;
+        *)  marca_utc="${marca}Z" ;;
+        esac
+        marca_local=$(date -d "$marca_utc" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || true)
+        if [ -n "$marca_local" ]; then
+            printf 'ultimo apagado : SI, por firmware, el %s (%s)\n' "$marca_local" "$marca"
+        else
+            printf 'ultimo apagado : SI, por firmware, el %s\n' "$marca"
+        fi
     else
         printf 'ultimo apagado : no consta que la aplicacion se haya ejecutado nunca\n'
     fi

@@ -54,21 +54,28 @@ mismo fuente se compila por las dos vias, que no estan disponibles en las mismas
   `/boot` ni escribir en la ESP durante la ventana de apagado, que es justo el problema que
   tiene la rama de GRUB (los montajes mueren antes de `shutdown.target`, y por eso ella
   monta `/boot` a mano). Aqui la ESP solo se toca al instalar.
-* **Anti-bucle**: la aplicacion borra `LoaderEntryOneShot` *antes* de apagar. Si el firmware
-  no llegara a apagarse, el arranque siguiente es el normal. El fichero de la entrada se
-  queda a proposito y lo barre la limpieza del arranque, como ya hace la rama de GRUB con su
-  `custom.cfg`.
+* **Anti-bucle, con dos barreras**: la primera es el propio cargador, que consume
+  `LoaderEntryOneShot` al usar la entrada —es "para el arranque siguiente", y systemd-boot la
+  borra—; la segunda es la aplicacion, que la borra antes de apagar. Medido el 2026-10-06: con
+  el apagado ya hecho, el borrado de la aplicacion devolvio error porque systemd-boot se la
+  habia llevado antes, y no hubo bucle. El fichero de la entrada se queda a proposito y lo
+  barre la limpieza del arranque, como ya hace la rama de GRUB con su `custom.cfg`.
 * **Fallo seguro, siempre**: sin `ResetSystem`, o si vuelve sin apagar, la aplicacion
   devuelve `EFI_SUCCESS` y `systemd-boot` sigue con su menu y su entrada por defecto. Se
   pierde el ahorro de ese apagado, no el arranque. Lo mismo con el descubridor: lo que falte
   se dice con nombre y apellido y la orden no se lleva a cabo.
-* **Se deja ver**: antes de apagar escribe la hora del firmware en una variable propia
-  (`S5HaltLastRun`). Hace falta porque un apagado desde el cargador **no deja log del
-  kernel** —ni journal, ni `dmesg`, ni el testigo—: sin esa marca, distinguir "la aplicacion
-  se ejecuto" de "el firmware reinicio y nadie se entero" depende de la memoria de quien
-  hizo el ensayo, y eso no es evidencia. `s5-boot-halt estado` la lee (`ultimo apagado :
-  SI, por firmware, el 2026-10-06 13:37:35`), `armar` la borra para que lo que se lea sea de
-  ese ensayo, y `uninstall.sh` se la lleva.
+* **Se deja ver**: antes de apagar escribe la hora del firmware (**en UTC, con la `Z`**: la RTC
+  de esta maquina va en UTC, y la primera version guardaba `05:50:24` para un apagado de las
+  `13:50` locales) en una variable propia (`S5HaltLastRun`). Hace falta porque un apagado desde
+  el cargador **no deja log del kernel** —ni journal, ni `dmesg`, ni el testigo—: sin esa
+  marca, distinguir "la aplicacion se ejecuto" de "el firmware reinicio y nadie se entero"
+  depende de la memoria de quien hizo el ensayo, y eso no es evidencia. `s5-boot-halt estado`
+  la lee y la traduce a hora local (`ultimo apagado : SI, por firmware, el 2026-10-06
+  13:50:24 CST`), `armar` la borra para que lo que se lea sea de ese ensayo, y `uninstall.sh`
+  se la lleva. La aplicacion tambien imprime el `EFI_STATUS` en hexadecimal cuando algo falla:
+  ese numero en pantalla es la unica pista que queda. La consola de un ensayo real, en
+  [`docs/img/rehearsal-2026-10-06.jpg`](img/rehearsal-2026-10-06.jpg), es este texto y nada
+  mas: no hay kernel detras que lo cuente.
 * **No toca nada que ya exista**: anade una entrada nueva y una variable EFI. No cambia el
   cargador, ni el kernel, ni las entradas previas. `uninstall.sh` y `s5-boot-halt abortar`
   lo dejan como estaba.

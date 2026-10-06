@@ -30,14 +30,20 @@
  * maquina donde se escribio esto pasa justo eso, y con clang+lld sale una imagen
  * PE valida y mas pequena. Las dos estan documentadas en docs/systemd-boot-halt.md.
  *
- * ANTI-BUCLE, y es lo unico que hace aparte de apagar: borra la variable EFI
- * `LoaderEntryOneShot` ANTES de llamar a ResetSystem. Si el firmware no llegara a
- * apagarse (o ResetSystem volviera), el arranque siguiente es el normal; sin ese
- * borrado, una aplicacion rota y una variable olvidada serian un bucle de
- * arranques que solo se arregla desde otra maquina. El fichero de la entrada se
- * queda en la ESP a proposito —una vez consumida la variable es una entrada mas
- * del menu— y lo barre el uninstall.sh, como ya hace la rama de GRUB con su
+ * ANTI-BUCLE. Borra la variable EFI `LoaderEntryOneShot` antes de llamar a
+ * ResetSystem, como segunda barrera: la primera es el propio cargador, que la
+ * consume al usar la entrada (medido el 2026-10-06: con el apagado hecho, el
+ * borrado de aqui devolvio error porque systemd-boot ya se la habia llevado). Las
+ * dos apuntan a lo mismo —si el firmware no llegara a apagarse, o si ResetSystem
+ * volviera, el arranque siguiente es el normal—, y el fichero de la entrada se
+ * queda en la ESP a proposito: una vez consumida la variable es una entrada mas
+ * del menu, y la barre el uninstall.sh, como ya hace la rama de GRUB con su
  * custom.cfg.
+ *
+ * DILO EN VOZ ALTA. Todo lo que pasa aqui se imprime en la consola del firmware,
+ * que es el unico sitio donde puede quedar constancia: en ese arranque no hay
+ * kernel, asi que no hay journal, ni dmesg, ni testigo. Por eso se escribe tambien
+ * la marca de ejecucion (ver marcar()).
  *
  * FALLO SEGURO, SIEMPRE. Si no hay ResetSystem, o si vuelve sin apagar, esto
  * devuelve EFI_SUCCESS y systemd-boot sigue con su menu y su entrada por defecto:
@@ -83,6 +89,22 @@ static void decir(EFI_SYSTEM_TABLE *st, CHAR16 *texto)
 		st->ConOut->OutputString(st->ConOut, texto);
 }
 
+/* Un EFI_STATUS en hexadecimal: si algo falla, ese numero es la unica pista que
+ * queda en pantalla, y "no pude borrar X" sin el codigo obliga a adivinar. */
+static void decir_status(EFI_SYSTEM_TABLE *st, EFI_STATUS rc)
+{
+	static const char hex[] = "0123456789ABCDEF";
+	CHAR16 b[12];
+	int i;
+
+	b[0] = '0';
+	b[1] = 'x';
+	for (i = 0; i < 8; i++)
+		b[2 + i] = (CHAR16)hex[((unsigned)rc >> ((7 - i) * 4)) & 0xf];
+	b[10] = '\0';
+	decir(st, b);
+}
+
 /*
  * MARCA DE EJECUCION. Un apagado desde el cargador no deja NINGUN log del kernel:
  * ni journal, ni dmesg, ni el testigo. Sin algo escrito desde aqui, saber si el
@@ -122,6 +144,11 @@ static EFI_STATUS marcar(EFI_SYSTEM_TABLE *st)
 	iso[i++] = ':';
 	DIG2(t.Second);
 #undef DIG2
+	/* La RTC de esta maquina va en UTC (timedatectl: RTC time = Universal time),
+	 * asi que la hora del firmware se guarda tal cual y con la Z: quien la lea
+	 * sabe que es UTC y la traduce. El 2026-10-06 se guardo "05:50:24" para un
+	 * apagado de las 13:50 locales, y ese despiste es el que evita la Z. */
+	iso[i++] = 'Z';
 	iso[i] = '\0';
 
 	for (n = 0; n <= i; n++)
@@ -154,13 +181,22 @@ EFI_STATUS efi_main(EFI_HANDLE imagen, EFI_SYSTEM_TABLE *st)
 	}
 
 	/*
-	 * ANTI-BUCLE. Se borra la variable de un solo uso y se dice si no se pudo:
-	 * un testigo que no se lee no sirve de nada, pero uno que miente es peor.
+	 * ANTI-BUCLE, y de paso una medicion. El 2026-10-06, con la entrada
+	 * consumida y el apagado hecho, este borrado devolvio error: systemd-boot
+	 * ya habia borrado LoaderEntryOneShot al usarla (la variable "es para el
+	 * arranque siguiente", y el cargador la consume). O sea que esta llamada es
+	 * una segunda barrera, no la unica, y el aviso de antes ("si esto no apaga,
+	 * el proximo arranque puede repetirlo") era demasiado alarmante para un
+	 * caso normal. Ahora se dice el codigo y lo que significa.
 	 */
 	rc = st->RuntimeServices->SetVariable(L"LoaderEntryOneShot", &loader_guid,
 					      0, 0, NULL);
-	if (EFI_ERROR(rc))
-		decir(st, L"s5-halt: aviso: no pude borrar LoaderEntryOneShot; si esto no apaga, el proximo arranque puede repetirlo\r\n");
+	if (EFI_ERROR(rc)) {
+		decir(st, L"s5-halt: LoaderEntryOneShot ya no estaba (status ");
+		decir_status(st, rc);
+		decir(st, L"); el cargador la consume al usar la entrada, asi que\r\n");
+		decir(st, L"         el arranque siguiente es el normal aunque esto no apague\r\n");
+	}
 
 	/* La marca va despues del borrado: asi, si el apagado ocurre, lo que queda
 	 * escrito es "la aplicacion llego hasta aqui", no "alguien la armo". */
