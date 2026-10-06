@@ -4,6 +4,11 @@ Extracted from the lab notebook for this case (2026-08-07 → 2026-08-15). What 
 are instrumented measurements, not impressions: every row is a real shutdown with a
 battery `energy_now` reading before and after.
 
+> A **second unit** of the same model (`8E35`), with `systemd-boot` instead of GRUB and an
+> in-kernel arming module instead of the akmod, is documented separately in
+> [`EVIDENCE-second-unit.md`](EVIDENCE-second-unit.md). It is a different machine: its rows
+> are not part of the table below and rule 1 applies between the two documents too.
+
 ## How to read these numbers
 
 1. **Raw watts are NOT comparable across windows of different length.** Use energy and
