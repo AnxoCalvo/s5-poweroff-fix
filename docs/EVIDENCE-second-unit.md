@@ -140,12 +140,22 @@ Owed, and only one window (one poweroff):
    which one you get.** On this unit the dGPU *and* its root port were in `D0` when the shield armed
    (port `child_count=1`: the port cannot suspend while the GPU under it is active). With no wait in
    front of it that subtree was still `D0` after `device_shutdown()` and the rail stayed on (18.51 W);
-   with a wait, the same arming-time state ended in a released rail (0.43 W). The arming snapshot is
-   therefore not a prediction, and the `FINAL` observer is what closes the gap: it prints the state
-   *after* the walk, so the owed window is being taken with the console held open (`final_hold_ms`) to
-   photograph whether the dGPU ended in `D3cold` with the bridge out of `D0`, or whether something held
-   it to the end. Either reading is a real result, and the second would mean the rare case is not as
-   rare as the arming-time snapshot suggests.
+   with a wait, the same arming-time state ended in a released rail (0.43 W).
+   The arming block of the 2026-10-06 poweroff was photographed, and it is the healthy end of that
+   range rather than the dangerous one: the dGPU was **already `D3cold`** when the shield armed, so the
+   20 s budget was spent in **100 ms** waiting for the bridge alone, and the dGPU, its audio function
+   and the port all read `D3cold` / `rpm=suspended` / `use=0 child=0`. Nothing could have woken that
+   subtree; the rail was cut. Which is also the honest limit of the observation: it says the wait costs
+   almost nothing when the compositor has already let go, not that it is unnecessary — the poweroff
+   where the subtree is still awake is the one measured at 18.51 W.
+   The `FINAL` line *after* the walk exists but cannot be read on this unit, and that too is now
+   measured rather than assumed. The photograph ends at the shield's `done:` line — the end of the
+   reboot notifier, i.e. *before* `device_shutdown()` — and the screen then stayed dark **with the
+   backlight on for 5–8 s**, which is the diagnostic console hold (`final_hold_ms=8000`) executing,
+   before the machine switched off. So the `POWER_OFF_PREPARE` observer runs and prints, but the
+   display is already down by then: the device walk takes it down before the observer is called. The
+   end state is therefore still read from the arming block plus the window, not from a `FINAL` line,
+   and the hold is a knob that only delays the poweroff.
 2. **`D0` per se is not the expensive state; a device that is genuinely in use is.** Upstream's
    `gpu-en-uso-v1` (19.38 W) is a GPU pinned awake and working; an idle `D0` device on this unit cost
    nothing measurable over 50 minutes. The two are worth separating in the policy: what the GRUB
