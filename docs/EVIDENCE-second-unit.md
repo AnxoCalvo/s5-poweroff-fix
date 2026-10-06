@@ -159,14 +159,15 @@ window at 5000 ms would say nothing the rows above do not already say.
    subtree; the rail was cut. Which is also the honest limit of the observation: it says the wait costs
    almost nothing when the compositor has already let go, not that it is unnecessary — the poweroff
    where the subtree is still awake is the one measured at 18.51 W.
-   The `FINAL` line *after* the walk exists but cannot be read on this unit, and that too is now
-   measured rather than assumed. The photograph ends at the shield's `done:` line — the end of the
-   reboot notifier, i.e. *before* `device_shutdown()` — and the screen then stayed dark **with the
-   backlight on for 5–8 s**, which is the diagnostic console hold (`final_hold_ms=8000`) executing,
-   before the machine switched off. So the `POWER_OFF_PREPARE` observer runs and prints, but the
-   display is already down by then: the device walk takes it down before the observer is called. The
-   end state is therefore still read from the arming block plus the window, not from a `FINAL` line,
-   and the hold is a knob that only delays the poweroff.
+   The `FINAL` line *after* the walk has never been observed here, and the diagnostic hold is now ruled
+   out as the reason. The photograph ends at the shield's `done:` line — the end of the reboot
+   notifier, i.e. *before* `device_shutdown()` — and the screen then stays dark **with the backlight
+   on** for about five seconds before the machine switches off. That is what it does with
+   `final_hold_ms=8000` (5–8 s) and with the default `0` (~5 s), so the interval is this machine's own
+   S5 transition, not the hold; and a hold that leaves no trace is a hold that did not run, so there is
+   no evidence the `POWER_OFF_PREPARE` observer was called at all. Either the display is already down
+   when it is, or the handler is not reached on this path. The end state is therefore read from the
+   arming block plus the window, not from a `FINAL` line.
 2. **`D0` per se is not the expensive state; a device that is genuinely in use is.** Upstream's
    `gpu-en-uso-v1` (19.38 W) is a GPU pinned awake and working; an idle `D0` device on this unit cost
    nothing measurable over 50 minutes. The two are worth separating in the policy: what the GRUB
