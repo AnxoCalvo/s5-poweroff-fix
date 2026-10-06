@@ -52,7 +52,12 @@ check:
 		echo "via gnu-efi + objcopy: no (falta gnu-efi o el objetivo efi-app-x86_64)"; \
 	fi; \
 	if command -v $(CLANG) >/dev/null 2>&1 && command -v $(LLDLINK) >/dev/null 2>&1; then \
-		echo "via clang + lld-link: LISTA"; ok=1; \
+		if [ -e "$(EFIINC)/efi.h" ]; then \
+			echo "via clang + lld-link: LISTA (cabeceras de gnu-efi en $(EFIINC))"; ok=1; \
+		else \
+			echo "via clang + lld-link: falta solo las cabeceras, no la libreria -> instala gnu-efi"; \
+			echo "   ($(EFIINC)/efi.h no existe; sin el, clang falla con: 'efi.h' file not found)"; \
+		fi; \
 	else \
 		echo "via clang + lld-link: no (falta clang o lld-link)"; \
 	fi; \
