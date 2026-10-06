@@ -25,5 +25,11 @@ modules.order
 /kmod/rpmbuild/
 *.rpm
 
+# La aplicacion EFI se compila en cada `s5-boot-halt instalar` desde
+# system/efi/s5-halt.c: por la misma razon que el .ko, no se versiona. Un .efi
+# guardado a mano es el que un dia se instala sin pasar por el fuente.
+system/efi/*.efi
+system/efi/*.so
+
 # guion de una noche concreta, no parte del proyecto
 /preparar-medida.sh
