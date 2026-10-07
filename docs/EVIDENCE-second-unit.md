@@ -12,9 +12,9 @@ raw watts do not survive a change of window length.
 |---|---|---|
 | board / firmware | HP OMEN 16-ap0xxx (`8E35`), BIOS F.13 | same model, same firmware |
 | CPU / dGPU | Ryzen 9 **8940HX** + RTX 5060 Max-Q | Ryzen 9 **8945HX** + RTX 5060 Max-Q — same model, different SKU |
-| distribution / kernel | Fedora, akmod | Arch Linux, `7.2.8-arch1-2` |
+| distribution / kernel | Fedora, akmod | Arch Linux, `7.2.8-arch1-2` → `7.2.9-arch1-1` (the module is packaged as DKMS and rebuilt itself across the crossing) |
 | bootloader | GRUB2 | **systemd-boot** |
-| rare-case fallback | 90 s wait, then a one-shot GRUB `halt` (0.32 W) | **none** |
+| rare-case fallback | 90 s wait, then a one-shot GRUB `halt` (0.32 W) | **none in the policy**; the systemd-boot equivalent has been measured by hand (below), and is the subject of [#4](https://github.com/AnxoCalvo/s5-poweroff-fix/pull/4) |
 | shield | `s5_pmrt_arm`, armed by the `99y` shutdown hook | `s5_shield`, armed from the **reboot notifier** inside `kernel_power_off()` |
 | measurement | `s5-energy-log` | shutdown/boot witness service + `bin/s5-evidence` |
 
@@ -50,10 +50,12 @@ Two differences matter to this repository:
    writing `on` then `auto` to `power/control` is `pm_runtime_forbid()` + `pm_runtime_allow()`, i.e. a
    resume followed by an `rpm_idle()` - but it has the same ceiling, and it *wakes* whatever is asleep,
    so it may only be applied to the device that is already awake.
-2. **No GRUB, so no `halt` branch.** On this unit the rare case (a GPU that is genuinely awake or busy
-   at poweroff) currently has no safety net at all. What a systemd-boot equivalent needs, and why
-   `bootctl set-oneshot` + an EFI halt application is the shape of it, is a separate contribution; it
-   is not measured here and no row below covers that case.
+2. **No GRUB, so no `halt` branch — but the systemd-boot equivalent exists, and it is measured.**
+   On this unit the rare case (a GPU that is genuinely awake or busy at poweroff) still has no safety
+   net in the policy. What the equivalent needs is a one-shot systemd-boot entry that powers the
+   machine off from the boot loader, with no Linux kernel in that boot; its two windows are in
+   [The firmware power-off path](#the-firmware-power-off-path) below, and the mechanism itself is the
+   subject of [#4](https://github.com/AnxoCalvo/s5-poweroff-fix/pull/4).
 
 ## How these rows were taken
 
@@ -144,6 +146,61 @@ as a row.
 out with the dGPU still in `D0`, and the A/B above then showed that the interesting parameter is not
 the *length* of the wait but its presence: `0` versus a budget long enough to settle. A screening
 window at 5000 ms would say nothing the rows above do not already say.
+
+## The firmware power-off path
+
+The reference machine's rare case diverts the poweroff through GRUB's `halt`, so that no Linux kernel
+runs in that boot: `grub-halt` measured 1.05 W over 45 min, and `politica-grub-real-v1` 0.32 W over
+9.55 h. This unit has no GRUB. The equivalent here is a one-shot systemd-boot entry — systemd-boot's
+own `auto-poweroff` entry, which calls `RT->ResetSystem(EfiResetShutdown)` — armed with
+`bootctl set-oneshot auto-poweroff`, so the machine powers off from the boot loader with no kernel in
+that boot.
+
+Two windows, deliberately the same length and the same arm-time state: the dGPU pinned in `D0` with
+`power/control=on` (the method of `gpu-en-uso-v1`, applied by hand before the shutdown), charger
+unplugged at both ends, and the shutdown/boot witness of this unit as the instrument.
+
+| date | label | result | verdict |
+|---|---|---|---|
+| 10-06 | `halt-path-rare-builtin-1.5` | 3.404 Wh / 0.7628 h ⇒ **4.46 W** | ledger `FAIL`, the row tool graded it `borderline` — **superseded**: `energy_full` moved 4.77 Wh *inside* the window (80.747 → 75.976 Wh), which no other window of this unit has done, and the gauge's own percentages (53 % → 51 %) say about half the absolute figure |
+| 10-07 | **`halt-path-rare-builtin-2`** | **1.007 Wh / 0.7622 h ⇒ 1.32 W** | **CLEAN** — ledger `OK`, boot check `FORWARD`, and the `check-failed` marker cleared on that boot |
+
+Three things about the second window, because they are what make it the row and not the first one:
+
+* **It is comparable to the reference `grub-halt` window under rule 1** — 0.7622 h against its 45 min,
+  1.32 W against 1.05 W — and to the first pass, which is the same 0.76 h. What it says is that on this
+  firmware the EFI `ResetSystem(EfiResetShutdown)` path lands in the same place as GRUB's ACPI `halt`,
+  not several times above it.
+* **No kernel ran inside it.** The journal's boot list has the boot that shut down ending at 12:12:01
+  and the next one starting at 12:57:28, and the witness log holds exactly one shutdown record and one
+  boot record for the window. That is the whole point of the path: the firmware does its S5 with the
+  hardware as the boot loader left it.
+* **It is the hard case, not the benign one.** `power/control=on` forbids runtime suspend on the dGPU
+  and its functions, so the subtree is awake when the shield arms, and the witness says what that
+  means: `dGPU=D0 port=D0 audio=D0` at entry, still `D0` after 6000 ms (`it does not suspend on its
+  own`), and `state=D0 rpm=active` for all three devices in its final block. That is the same arm-time
+  state that measured **18.51 W** through a *normal* poweroff with `wait_ms=0` — the case the shield's
+  wait exists for. Here the exit path is the boot loader's instead, and that same state ends at
+  **1.32 W**.
+* **It ran across a kernel crossing** (`7.2.8-arch1-2` → `7.2.9-arch1-1`). The DKMS package rebuilt the
+  module for the new kernel (`srcversion` unchanged, `BFE3D9DD62D07BFCBB4003A`), the shield loaded and
+  armed, and the row carries the new kernel — the same silent-failure mode the reference machine checks
+  after every crossing.
+
+What this does **not** say: the arming here was manual (`bootctl set-oneshot auto-poweroff`). Arming it
+from the real shutdown path — after `shutdown.target`, which is where the GRUB branch of PR #4 found
+`/boot` already unmounted — is still open.
+
+```
+window    : 2026-10-07T12:11:53+08:00 -> 12:57:37+08:00   (0.7622 h, 1.0070 Wh, 1.32 W)
+shutdown  : battery 51.808 Wh (68%), ac_online=0, uptime 1884 s
+            s5_shield: loaded, srcversion=BFE3D9DD62D07BFCBB4003A devs=0000:01:00.0,0000:01:00.1,0000:00:01.1 wait_ms=20000
+            holders at entry: none    energy_full=75849000  voltage_now=11321000
+boot      : battery 50.801 Wh (67%), ac_online=0, uptime 9 s
+            energy_full=75270000  voltage_now=11094000  check: OK - FORWARD
+ledger    : 2026-10-07T12:57:37  0.7622 h  1.0070 Wh  1.32 W  OK    halt-path-rare-builtin-2
+first pass: 2026-10-06T23:20:13  0.7628 h  3.4040 Wh  4.46 W  FAIL  halt-path-rare-builtin-1.5
+```
 
 ## One finding, and one open question
 

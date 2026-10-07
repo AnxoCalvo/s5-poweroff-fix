@@ -91,7 +91,7 @@ keys and touches no database. Unsigned, `systemd-boot` will not load it, the men
 the usual thing boots: nothing breaks, but nothing is saved either. That is why `instalar`
 checks the signature (`sbctl verify`) and refuses to go on if it cannot sign it.
 
-## What is tested and what is not (2026-10-06)
+## What is tested and what is not (2026-10-07)
 
 * **Tested**: the discovery script and the failure branches of everything else, on an `8E35`
   with `systemd-boot` 262 (ESP at `/boot`, one-shot entry supported, Secure Boot on). `estado`
@@ -110,11 +110,14 @@ checks the signature (`sbctl verify`) and refuses to go on if it cannot sign it.
   [`docs/img/rehearsal-2026-10-06.jpg`](img/rehearsal-2026-10-06.jpg)). The second version of the
   delete-warning is also covered by that run: systemd-boot had already taken the variable, the
   delete returned an error, and there was no loop.
-* **Measured once, pending a repeat**: the rare case (dGPU pinned in D0 with `power/control=on`)
-  powered off through systemd-boot's built-in `auto-poweroff` entry, with no kernel in that boot,
-  gave 3.404 Wh over 0.7628 h ⇒ 4.46 W. It is a single window, the tool grades it `borderline`,
-  and `energy_full` moved inside the window, so the figure is being repeated before it is treated
-  as settled. The row goes into `docs/EVIDENCE.md`.
+* **Measured, twice**. The rare case (dGPU pinned in `D0` with `power/control=on`) powered off
+  through systemd-boot's built-in `auto-poweroff` entry, with no kernel in that boot. The first
+  window (0.7628 h) read 4.46 W and its `energy_full` moved 4.77 Wh *inside* it, so it was repeated;
+  the repeat (0.7622 h) read **1.007 Wh ⇒ 1.32 W**, ledger `OK`. Both are the same 0.76 h window, so
+  they are comparable to each other and to the reference `grub-halt` window (1.05 W over 45 min):
+  on this firmware the EFI `ResetSystem(EfiResetShutdown)` path lands in the same place as GRUB's
+  ACPI `halt`. Both windows, their registers and what each one can carry are in
+  [`EVIDENCE-second-unit.md`](EVIDENCE-second-unit.md#the-firmware-power-off-path).
 * **Open question, not a defect**: the built-in `auto-poweroff` entry makes this whole
   application optional. It powers off the same way at the same stage with no build, no signature
   and no write to the ESP — the price is the `S5HaltLastRun` marker. Which of the two should be
