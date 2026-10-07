@@ -168,6 +168,11 @@ Fedora path has run on real hardware here; the Debian one is covered by fixtures
 `tests/ensayo-ramas.sh`. Everything else — which is where the 19 W actually comes from —
 is distro-agnostic.
 
+**systemd-boot:** there is no equivalent of the GRUB branch here. Without GRUB the rare
+case self-disables as above, and the rest of the fix works the same. For Arch with
+systemd-boot, the owner of the second unit maintains an independent implementation,
+[s5-shield](https://github.com/December172/s5-shield).
+
 ## Checking it is still alive
 
 `s5-mitigacion-check` runs itself on every boot and looks both ways: whether you will be
@@ -207,8 +212,12 @@ walking down dead ends that have already been walked.
 
 Honestly:
 
-- Measured on **one machine** (HP OMEN 16-ap0xxx, Fedora 44, RTX + integrated Radeon).
-  The mechanism is generic; the numbers are not.
+- Measured here on **one machine** (HP OMEN 16-ap0xxx, Fedora 44, RTX + integrated Radeon).
+  A **second unit** of the same model (another CPU SKU, Arch + systemd-boot, its own
+  implementation of the same two halves) reproduced both the drain and the fix: 20.33 W →
+  0.42 W over the same 2.5 h window — see
+  [`docs/EVIDENCE-second-unit.md`](docs/EVIDENCE-second-unit.md). The mechanism is
+  generic; the numbers are not.
 - The overnight measurement is at **n=8** (0.46 / 0.46 / 0.47 / 0.45 / 0.41 / 0.42 / 0.43 /
   0.45 W), but all eight are the same laptop: they repeat the measurement, they do not
   make it independent.
