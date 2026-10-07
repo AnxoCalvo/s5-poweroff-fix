@@ -6,7 +6,7 @@
 #
 #     BOOT_ESP        ESP mount point (/boot, /efi, /boot/efi...)
 #     BOOT_BOOTCTL    the bootctl binary, or empty
-#     BOOT_ONESHOT    "si" if this systemd-boot understands one-shot entries
+#     BOOT_ONESHOT    "yes" if this systemd-boot understands one-shot entries
 #     BOOT_EFIVARS    /sys/firmware/efi/efivars (needed for arming)
 #     BOOT_RUTA       app | builtin: which entry is used to power off
 #     BOOT_ARMAR_ID   the id that goes into the one-shot variable
@@ -132,7 +132,7 @@ fi
 # direct read and not an assumption about versions.
 if [ -n "$BOOT_BOOTCTL" ]; then
     if "$BOOT_BOOTCTL" status 2>/dev/null | grep -q 'One-shot entry control'; then
-        BOOT_ONESHOT=si
+        BOOT_ONESHOT=yes
     elif [ "$BOOT_ARMAR" = 1 ] && ! esp_ahora; then
         # Without the ESP it cannot be asked. It arms anyway: arming is writing an
         # EFI variable, and the boot loader's capability was checked at install time. It
@@ -165,7 +165,7 @@ fi
 # default entry boots: a benign failure, but the saving is lost. It is detected in
 # order to be able to warn BEFOREHAND (at installation) and not during a poweroff.
 if [ -n "$BOOT_BOOTCTL" ] && "$BOOT_BOOTCTL" status 2>/dev/null | grep -q 'Secure Boot: enabled'; then
-    BOOT_SB=si
+    BOOT_SB=yes
 fi
 
 # --- the two pieces on the ESP -------------------------------------------

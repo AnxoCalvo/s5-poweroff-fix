@@ -51,7 +51,7 @@ exigir_root() {
 limite_para() {   # $1 = what is to be done
     case "$1" in
     instalar) [ -n "$BOOT_ESP" ] && [ -n "$BOOT_BOOTCTL" ] ;;
-    armar)    [ -n "$BOOT_ESP" ] && [ -n "$BOOT_BOOTCTL" ] && [ "$BOOT_ONESHOT" = si ] \
+    armar)    [ -n "$BOOT_ESP" ] && [ -n "$BOOT_BOOTCTL" ] && [ "$BOOT_ONESHOT" = yes ] \
                   && [ -n "$BOOT_EFIVARS" ] && [ -e "$BOOT_HALT_ENTRY" ] && [ -e "$BOOT_HALT_EFI" ] ;;
     esac
 }
@@ -157,7 +157,7 @@ instalar() {
     echo
     echo "== 2. sign (only if needed) =="
     efi="$HERE/system/efi/s5-halt.efi"
-    if [ "$BOOT_SB" = si ]; then
+    if [ "$BOOT_SB" = yes ]; then
         # The application is signed by the user with THEIR keys: this project does
         # not install keys or touch the Secure Boot database.
         if command -v sbctl >/dev/null 2>&1; then
