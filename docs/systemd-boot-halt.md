@@ -55,7 +55,9 @@ machines:
 * **Arming means writing an EFI variable** (`bootctl set-oneshot s5-halt`). Nothing has to mount
   `/boot` or write to the ESP during the poweroff window, which is precisely the problem the
   GRUB branch has (mounts die before `shutdown.target`, which is why it mounts `/boot` by hand).
-  Here the ESP is only touched at install time.
+  Here the ESP is only touched at install time. See
+  [Arming when the ESP is already gone](#arming-when-the-esp-is-already-gone) — that sentence was
+  true of `bootctl` from the start and false of this repository's own discovery until 2026-10-07.
 * **Anti-loop, with two barriers**: the first is the boot loader itself, which consumes
   `LoaderEntryOneShot` when it uses the entry —it is "for the next boot", and systemd-boot
   deletes it—; the second is the application, which deletes it before powering off. Measured on
@@ -82,6 +84,44 @@ machines:
 * **It touches nothing that already exists**: it adds a new entry and an EFI variable. It does
   not change the boot loader, the kernel, or any previous entry. `uninstall.sh` and
   `s5-boot-halt abortar` leave it as it was.
+
+## Arming when the ESP is already gone
+
+The GRUB branch of this repository has to mount `/boot` itself during shutdown, because the mounts
+die before `shutdown.target` (measured 2026-08-11: `boot.mount` is unmounted 100 ms before
+`shutdown.target` is reached). This route was designed not to need that — and the claim held for
+`bootctl`, but not for this repository's own guard, which is the part that mattered.
+
+The check, run as a normal user so it cannot write:
+
+```
+$ bootctl --esp-path=/tmp/empty-esp set-oneshot <some-id>
+Failed to update EFI variable 'LoaderEntryOneShot-4a67b082-...': Permission denied
+```
+
+It reaches the variable write and fails only on permissions: `bootctl set-oneshot` does not read the
+ESP at all. What refused to arm was our discovery script, asking one question — *is everything
+installed?* — where the shutdown path needs a different one — *can I write the variable?* The two are
+now separate. `s5-politica-boot` sets `S5_BOOT_ARMAR=1` for itself, and with it the conditions that
+only matter for installing become warnings (`BOOT_AVISO`, printed to the log) instead of blockers
+(`BOOT_LIMITE`); `bootctl` and efivarfs stay hard requirements. Installing still asks the strict
+question, and provoking the failure branches still fails.
+
+The route is chosen with `S5_BOOT_RUTA`:
+
+| route | what is armed | what it needs at arming time | what it costs |
+|---|---|---|---|
+| `app` (default) | `s5-halt`, our EFI application | `bootctl` + efivarfs; the entry and application are re-checked only if the ESP happens to be mounted | the app has to be built, signed and installed |
+| `builtin` | `auto-poweroff`, the boot loader's own "Power Off The System" entry | `bootctl` + efivarfs, and `auto-poweroff yes` in `loader.conf` (v255+) | no `S5HaltLastRun` marker |
+
+The measured poweroff path in [`EVIDENCE-second-unit.md`](EVIDENCE-second-unit.md#the-firmware-power-off-path)
+is the `builtin` one.
+
+And it was exercised at that stage, not only argued: a systemd-shutdown hook — systemd runs those
+after the filesystems are gone, so it is inside the real window by construction — armed
+`auto-poweroff` with the ESP unmounted. `loader.conf` on that machine sets `default arch.conf`, so
+the menu coming up with "Power Off The System" preselected can only come from the armed one-shot; the
+machine then powered off and stayed off until the power button was pressed. Measured 2026-10-07.
 
 ## Secure Boot
 
@@ -110,6 +150,12 @@ checks the signature (`sbctl verify`) and refuses to go on if it cannot sign it.
   [`docs/img/rehearsal-2026-10-06.jpg`](img/rehearsal-2026-10-06.jpg)). The second version of the
   delete-warning is also covered by that run: systemd-boot had already taken the variable, the
   delete returned an error, and there was no loop.
+* **Tested on 2026-10-07, in the real window**: arming after `shutdown.target` with the ESP
+  unmounted, from a systemd-shutdown hook, with the `builtin` route. The record that it took is the
+  loader's own preselection: `loader.conf` says `default arch.conf`, and the menu came up with
+  "Power Off The System" preselected, which nothing but an armed one-shot produces. The machine
+  powered off and stayed off until the power button was pressed. Before this, the discovery refused
+  at that stage — see [Arming when the ESP is already gone](#arming-when-the-esp-is-already-gone).
 * **Measured, twice**. The rare case (dGPU pinned in `D0` with `power/control=on`) powered off
   through systemd-boot's built-in `auto-poweroff` entry, with no kernel in that boot. The first
   window (0.7628 h) read 4.46 W and its `energy_full` moved 4.77 Wh *inside* it, so it was repeated;
