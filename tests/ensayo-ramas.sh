@@ -1028,6 +1028,25 @@ politica() {  # politica <titulo> <condicion evaluable, usa $POLOUT y $F>
          malas=$((malas+1)); fi
 }
 
+# EL VERIFICADOR SOBRE EL LOG QUE LA POLITICA ESCRIBE DE VERDAD. La auditoria de
+# la rama de GRUB en s5-mitigacion-check (§9bis, "consiguio /boot en rw") se
+# engancha al LITERAL `enrutando por GRUB` que escribe la politica, y ningun caso
+# la ejercitaba. Encontrado el 2026-10-07 revisando un PR (#4) que reescribia esa
+# linea para todas las maquinas: con el texto nuevo, un rescate de GRUB que no
+# consigue /boot dejaba de dar FALLO y pasaba en silencio (regla 11). El ensayo
+# seguia en 92/92 porque los fixtures de arriba llevan el literal copiado a mano,
+# y una copia no se entera de que el original cambio. Por eso aqui no hay
+# fixture: el log sale de correr la politica, y es ese el que se audita.
+audita_rama_grub() {  # audita_rama_grub <titulo> <esperado(regex)> <log REAL de la politica>
+    n=$((n+1))
+    local linea
+    linea="$(env PCILOG="$3" ELOG="$F/e-bajo.log" S5_DESCUBRE="$F/no-existe" bash "$CHK" 2>&1 \
+             | grep -E 'politica \(.*rama de GRUB' | head -3)"
+    if printf '%s' "$linea" | grep -qE "$2"; then printf '  [ok]    %s\n' "$1"
+    else printf '  [MAL]   %s\n          esperaba /%s/\n          obtuvo:  %s\n' "$1" "$2" "${linea:-(nada)}"
+         malas=$((malas+1)); fi
+}
+
 politica_arma DESMONTADO
 politica_corre "$FULL_SIN_GRUBTOOLS" S5_DESCUBRE="$F/pol-descubre-sin-gpu" S5_POLITICA_MAXWAIT=0
 politica "sin dGPU localizada => no hay nada que decidir, apagado normal" \
@@ -1038,6 +1057,9 @@ politica_corre "$FULL_OK" S5_DESCUBRE="$F/pol-descubre-gpu" S5_POLITICA_MAXWAIT=
     S5_GRUB_DIRS="$F/fedora/grub2" POL_MOUNT_FALLA=1
 politica "abortar 1/5: no consigo /boot montado en rw" \
     'printf %s "$POLOUT" | grep -q "POLITICA ABORTADA: no consigo /boot montado en rw"'
+cp "$F/pol/log" "$F/pol-real-sin-boot.log"
+audita_rama_grub "...y el verificador, sobre ese log REAL, lo canta como FALLO (un rescate fallido no se calla)" \
+    'FALLO.*NO consiguio /boot' "$F/pol-real-sin-boot.log"
 
 politica_arma DESMONTADO
 politica_corre "$FULL_SIN_GRUBTOOLS" S5_DESCUBRE="$F/pol-descubre-gpu" S5_POLITICA_MAXWAIT=0 \
@@ -1108,6 +1130,9 @@ politica "armado: next_entry quedo grabado" \
     'grep -q "^next_entry=s5politica$" "$F/pol-grub-armado/grub2/grubenv"'
 politica "armado: la politica se dio por armada en el log" \
     'printf %s "$POLOUT" | grep -q "POLITICA armada"'
+cp "$F/pol/log" "$F/pol-real-armado.log"
+audita_rama_grub "...y el verificador, sobre ese log REAL, da por buena la rama de GRUB" \
+    'consiguio /boot en rw por su cuenta' "$F/pol-real-armado.log"
 politica "fallback: systemctl --force reboot no vuelve (shim) => cae a reboot -f" \
     '[ -s "$F/pol/reboot.log" ] && grep -q "^reboot -f$" "$F/pol/reboot.log"'
 politica "fallback: antes de reboot -f se intenta remontar / en ro" \
