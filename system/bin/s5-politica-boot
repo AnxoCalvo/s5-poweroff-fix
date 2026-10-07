@@ -1,43 +1,43 @@
 #!/bin/bash
-# s5-politica-boot — la rama del CASO RARO cuando no hay GRUB: systemd-boot.
+# s5-politica-boot — the RARE CASE branch when there is no GRUB: systemd-boot.
 #
-# QUE HACE, en orden:
-#   1. descubrir (s5-descubre-boot) y, si falta algo, decirlo y salir SIN tocar nada
-#   2. armar la entrada de un solo uso (una variable EFI) y VERIFICARLA
-#   3. reiniciar para que systemd-boot arranque s5-halt.efi, que apaga desde el
-#      firmware sin que llegue a ejecutarse un kernel
+# WHAT IT DOES, in order:
+#   1. discover (s5-descubre-boot) and, if something is missing, say so and exit WITHOUT touching anything
+#   2. arm the one-shot entry (an EFI variable) and VERIFY it
+#   3. reboot so that systemd-boot boots s5-halt.efi, which powers off from the
+#      firmware before a kernel ever gets to run
 #
-# Uso:
-#   s5-politica-boot              arma y reinicia (lo llama s5-gpu-politica)
-#   s5-politica-boot --armar-solo arma y NO reinicia (ensayo: deja el armado puesto)
-#   S5_POLITICA_DRYRUN=1 ...      no escribe nada, solo dice lo que haria
+# Usage:
+#   s5-politica-boot              arms and reboots (called by s5-gpu-politica)
+#   s5-politica-boot --armar-solo arms and does NOT reboot (rehearsal: leaves the arming in place)
+#   S5_POLITICA_DRYRUN=1 ...      writes nothing, only says what it would do
 #
-# POR QUE EXISTE. La rama de GRUB apaga con `halt` porque en ese arranque no llega
-# a ejecutarse un kernel de Linux: el firmware hace su S5 con el hardware tal y
-# como lo dejo el POST, y la medida sale limpia (`grub-halt`, 1,05 W, 2026-08-09).
-# En una maquina con systemd-boot no hay `halt`, y hacerlo desde un kernel vivo NO
-# es equivalente — medido y en docs/EVIDENCE.md: un modulo que llama a ResetSystem
-# por EFI deja el S5 en 19,26 W, y escribir PM1a_CNT sin `_PTS(5)` ni
-# `device_shutdown()` lo deja en 26,56 W. El mecanismo entero esta en
+# WHY IT EXISTS. The GRUB branch powers off with `halt` because in that boot no
+# Linux kernel ever gets to run: the firmware does its own S5 with the hardware just
+# as POST left it, and the measurement comes out clean (`grub-halt`, 1,05 W, 2026-08-09).
+# On a machine with systemd-boot there is no `halt`, and doing it from a live kernel is NOT
+# equivalent — measured and in docs/EVIDENCE.md: a module that calls ResetSystem
+# through EFI leaves S5 at 19,26 W, and writing PM1a_CNT without `_PTS(5)` or
+# `device_shutdown()` leaves it at 26,56 W. The whole mechanism is in
 # docs/systemd-boot-halt.md.
 #
-# VENTAJA SOBRE LA RAMA DE GRUB, y no es pequena: aqui NO hace falta montar /boot.
-# Los montajes mueren antes de `shutdown.target` (medido el 2026-08-11: boot.mount
-# se desmonta 100 ms ANTES de que se alcance shutdown.target), asi que la rama de
-# GRUB tiene que montarlo ella misma para escribir su custom.cfg. Aqui la entrada
-# esta escrita desde la instalacion y armar es solo escribir una variable EFI, que
-# vive en efivarfs y sigue montada. Menos cosas que pueden fallar en la ventana
-# mas delicada del apagado.
+# ADVANTAGE OVER THE GRUB BRANCH, and it is not small: here there is NO need to mount /boot.
+# Mounts die before `shutdown.target` (measured on 2026-08-11: boot.mount
+# is unmounted 100 ms BEFORE shutdown.target is reached), so the GRUB branch
+# has to mount it itself to write its custom.cfg. Here the entry
+# is written at installation time and arming is only writing an EFI variable, which
+# lives in efivarfs and stays mounted. Fewer things that can fail in the most delicate
+# window of the poweroff.
 #
-# FALLO SEGURO, SIEMPRE, y con la misma doctrina que la politica: si el
-# descubridor encuentra un limite, si la variable no queda escrita, si el
-# reinicio no da la vuelta — se registra, se dice, y el apagado sigue su curso
-# normal. Se pierde el ahorro; no se rompe el apagado.
+# FAIL SAFE, ALWAYS, and with the same doctrine as the policy: if the
+# discovery script finds a limit, if the variable does not end up written, if the
+# reboot does not go through — it is recorded, it is stated, and the poweroff continues its normal
+# course. The saving is lost; the poweroff is not broken.
 #
-# ANTI-BUCLE. La entrada es de un solo uso (la variable la consume systemd-boot) y
-# ademas s5-halt.efi BORRA esa variable antes de apagar: aunque el firmware no
-# llegara a apagarse, el arranque siguiente es el normal. La entrada se queda
-# escrita a proposito y la barre el uninstall.sh.
+# ANTI-LOOP. The entry is one-shot (the variable is consumed by systemd-boot) and
+# also s5-halt.efi DELETES that variable before powering off: even if the firmware did not
+# get to power off, the next boot is the normal one. The entry stays
+# written on purpose and uninstall.sh sweeps it away.
 
 set -u
 
@@ -49,97 +49,97 @@ FRENO=${S5_FRENO:-/var/lib/s5-test/gpu-politica-disabled}
 SOLO_ARMAR=0
 [ "${1:-}" = "--armar-solo" ] && SOLO_ARMAR=1
 
-# El log vive en / (btrfs) y en esta ventana / sigue en rw, pero todo va con
-# `|| true` por la misma razon que en la politica: un fallo de escritura no puede
-# matar el script.
+# The log lives in / (btrfs) and in this window / is still rw, but everything goes with
+# `|| true` for the same reason as in the policy: a write failure cannot
+# kill the script.
 say() { printf 'POLITICA-BOOT %s\n' "$*"; printf 'POLITICA-BOOT %s\n' "$*" >>"$LOG" 2>/dev/null || true; }
 
-# Mismo freno de mano que la politica y que el hook 99y: si esta puesto, no se
-# toca nada y se dice.
+# Same handbrake as the policy and as hook 99y: if it is set, nothing is
+# touched and it is stated.
 if [ -e "$FRENO" ]; then
-    say "FRENO: existe $FRENO => no se arma la salida por firmware; apagado normal"
+    say "BRAKE: $FRENO exists => firmware poweroff is not armed; normal poweroff"
     exit 1
 fi
 
-# La pregunta que se le hace al descubridor es la de ARMAR, no la de instalar. En
-# esta ventana la ESP ya no esta (medido el 2026-08-11: boot.mount se desmonta
-# 100 ms antes de `shutdown.target`) y armar no la necesita: `bootctl set-oneshot`
-# escribe una variable EFI. Sin decirle que es un armado, el descubridor declara
-# un limite que no existe y la via se queda muerta justo cuando hace falta.
+# The question asked of the discovery script is the ARMING one, not the installing one. In
+# this window the ESP is already gone (measured on 2026-08-11: boot.mount is unmounted
+# 100 ms before `shutdown.target`) and arming does not need it: `bootctl set-oneshot`
+# writes an EFI variable. Without telling it that this is an arming, the discovery script declares
+# a limit that does not exist and the route stays dead just when it is needed.
 S5_BOOT_ARMAR=1
 # shellcheck source=/dev/null
 if [ -r "$DESCUBRE" ]; then
     . "$DESCUBRE"
 else
-    say "falta $DESCUBRE (lo instala install.sh) => no se puede enrutar por systemd-boot"
+    say "missing $DESCUBRE (installed by install.sh) => cannot route through systemd-boot"
     exit 1
 fi
 
-say "sondeo: ruta=${BOOT_RUTA:-app} id=${BOOT_ARMAR_ID:-?} ESP=${BOOT_ESP:-?} esp_ahora=$([ -d "${BOOT_ESP:-/nonexistent}/loader/entries" ] && echo si || echo no) bootctl=${BOOT_BOOTCTL:-?} entrada_1uso=${BOOT_ONESHOT:-NO} efivarfs=${BOOT_EFIVARS:-NO} secureboot=${BOOT_SB:-no}"
-[ -n "${BOOT_AVISO:-}" ] && say "AVISO (no impide la via): $BOOT_AVISO"
+say "probe: route=${BOOT_RUTA:-app} id=${BOOT_ARMAR_ID:-?} ESP=${BOOT_ESP:-?} esp_now=$([ -d "${BOOT_ESP:-/nonexistent}/loader/entries" ] && echo yes || echo no) bootctl=${BOOT_BOOTCTL:-?} oneshot_entry=${BOOT_ONESHOT:-NO} efivarfs=${BOOT_EFIVARS:-NO} secureboot=${BOOT_SB:-no}"
+[ -n "${BOOT_AVISO:-}" ] && say "WARNING (does not block the route): $BOOT_AVISO"
 if [ -n "$BOOT_LIMITE" ]; then
-    say "NO SE PUEDE: $BOOT_LIMITE"
+    say "CANNOT: $BOOT_LIMITE"
     exit 1
 fi
-# Lo que SI hace falta para armar: donde escribir la variable y con que.
+# What IS needed to arm: where to write the variable and with what.
 if [ -z "$BOOT_EFIVARS" ] || [ -z "$BOOT_BOOTCTL" ]; then
-    say "NO SE PUEDE: hace falta bootctl y efivarfs para armar"
+    say "CANNOT: bootctl and efivarfs are needed to arm"
     exit 1
 fi
-# La entrada de la aplicacion se comprueba solo si la ESP esta delante: si no esta
-# no hay nada que leer, y lo que manda es lo que se comprobo al instalar. En la
-# ruta `builtin` no hay aplicacion que comprobar: la entrada la pone el cargador.
+# The application entry is checked only if the ESP is present: if it is not
+# there is nothing to read, and what was checked at install time governs. On the
+# `builtin` route there is no application to check: the entry is provided by the boot loader.
 if [ "${BOOT_RUTA:-app}" != builtin ] && [ -d "${BOOT_ESP:-/nonexistent}/loader/entries" ]; then
     if [ ! -e "$BOOT_HALT_EFI" ] || [ ! -e "$BOOT_HALT_ENTRY" ]; then
-        say "NO SE PUEDE: falta la aplicacion o la entrada en la ESP (sudo $BIN/s5-boot-halt instalar)"
+        say "CANNOT: missing the application or the entry on the ESP (sudo $BIN/s5-boot-halt instalar)"
         exit 1
     fi
 fi
 
 if [ "$DRYRUN" = 1 ]; then
-    say "DRYRUN: aqui haria '$BOOT_BOOTCTL set-oneshot $BOOT_ARMAR_ID' y reiniciaria"
-    say "DRYRUN: la via de systemd-boot HABRIA actuado (efectivo=$([ "$SOLO_ARMAR" = 1 ] && echo no || echo si))"
+    say "DRYRUN: here it would run '$BOOT_BOOTCTL set-oneshot $BOOT_ARMAR_ID' and reboot"
+    say "DRYRUN: the systemd-boot route WOULD have acted (effective=$([ "$SOLO_ARMAR" = 1 ] && echo no || echo yes))"
     exit 0
 fi
 
-# --- 1. armar ---------------------------------------------------------------
-# El id sale de la ruta: `s5-halt` (nuestra aplicacion, que deja la marca) o
-# `auto-poweroff` (la entrada integrada del cargador, que no deja ninguna).
+# --- 1. arm ---------------------------------------------------------------
+# The id comes from the route: `s5-halt` (our application, which leaves the marker) or
+# `auto-poweroff` (the boot loader's built-in entry, which leaves none).
 "$BOOT_BOOTCTL" set-oneshot "$BOOT_ARMAR_ID" >/dev/null 2>&1
 rc=$?
 if [ "$rc" != 0 ]; then
-    say "ARMAR FALLO: '$BOOT_BOOTCTL set-oneshot $BOOT_ARMAR_ID' rc=$rc => apagado normal"
+    say "ARM FAILED: '$BOOT_BOOTCTL set-oneshot $BOOT_ARMAR_ID' rc=$rc => normal poweroff"
     exit 1
 fi
 
-# La comprobacion que vale es leer la variable, no el rc de la herramienta: es lo
-# que va a leer systemd-boot al arrancar. efivarfs antepone 4 bytes de atributos a
-# cada variable, asi que el contenido empieza en el byte 5: sin saltarlos el valor
-# es "\x07s5-halt", la comparacion falla aunque el armado sea correcto, y esta via
-# se declara no disponible sin decir la verdad.
+# The check that counts is reading the variable, not the tool's rc: it is what
+# systemd-boot is going to read at boot. efivarfs prepends 4 attribute bytes to
+# each variable, so the content starts at byte 5: without skipping them the value
+# is "\x07s5-halt", the comparison fails even though the arming is correct, and this
+# route declares itself unavailable without telling the truth.
 v=$(ls -1 "$BOOT_EFIVARS"/LoaderEntryOneShot-* 2>/dev/null | head -1)
 if [ -z "${v:-}" ] || [ "$(tail -c +5 <"$v" 2>/dev/null | tr -d '\0')" != "$BOOT_ARMAR_ID" ]; then
-    say "ARMAR FALLO: la variable EFI no quedo con '$BOOT_ARMAR_ID' => apagado normal"
+    say "ARM FAILED: the EFI variable did not end up with '$BOOT_ARMAR_ID' => normal poweroff"
     exit 1
 fi
 
 if [ "${BOOT_RUTA:-app}" = builtin ]; then
-    say "ARMADO: next_entry=$BOOT_ARMAR_ID (variable EFI verificada). El proximo arranque lo apaga la entrada integrada del cargador, sin kernel"
+    say "ARMED: next_entry=$BOOT_ARMAR_ID (EFI variable verified). The next boot is powered off by the boot loader's built-in entry, without a kernel"
 else
-    say "ARMADO: next_entry=$BOOT_ARMAR_ID (variable EFI verificada). El proximo arranque lo hace s5-halt.efi"
+    say "ARMED: next_entry=$BOOT_ARMAR_ID (EFI variable verified). The next boot is done by s5-halt.efi"
 fi
 [ "$SOLO_ARMAR" = 1 ] && exit 0
 
-# --- 2. reiniciar -----------------------------------------------------------
-# Mismo camino que la politica: `systemctl --force reboot` desmonta o remonta en
-# solo lectura, y si no da la vuelta se baja a mano lo que quede y se usa
-# `reboot -f`, que es la llamada al sistema pelada.
+# --- 2. reboot -----------------------------------------------------------
+# Same path as the policy: `systemctl --force reboot` unmounts or remounts
+# read-only, and if it does not go through it brings down by hand whatever is left and uses
+# `reboot -f`, which is the bare system call.
 sync
-say "reiniciando para que systemd-boot apague desde el firmware (veras un POST; es lo esperado)"
+say "rebooting so that systemd-boot powers off from the firmware (you will see a POST; this is expected)"
 systemctl --force reboot >/dev/null 2>&1
 
 sleep 3
-say "systemctl --force reboot no dio la vuelta; usando reboot -f"
+say "systemctl --force reboot did not go through; using reboot -f"
 sync
 mount -o remount,ro / 2>/dev/null || true
 sync

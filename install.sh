@@ -76,23 +76,23 @@ if [ "$rc_grub" != 0 ] && [ "$(id -u)" = 0 ]; then
     echo "   AVISO: la rama de GRUB se autodesactiva (falla segura: apaga normal). El resto del arreglo NO depende de ella."
 fi
 
-# LA OTRA VIA DEL CASO RARO, la de systemd-boot. Se ensena por el mismo motivo
-# que la de GRUB — no se adivina, se dice lo que hay — y con la misma doctrina:
-# que falte NO aborta la instalacion, solo deja el caso raro sin salvavidas.
-# OJO: que el descubridor salga bien NO significa que la via este lista; la
-# aplicacion EFI hay que compilarla, firmarla (si hay Secure Boot) e instalarla
-# aparte con `s5-boot-halt instalar`, y por eso se dice tambien eso.
-paso "Via de systemd-boot para el caso raro"
+# THE OTHER RARE-CASE ROUTE, the systemd-boot one. It is shown for the same reason
+# as the GRUB one — it is not guessed, what is there is stated — and with the same doctrine:
+# that it is missing does NOT abort the installation, it only leaves the rare case without a lifeline.
+# NOTE: the discovery script succeeding does NOT mean the route is ready; the
+# EFI application has to be built, signed (if Secure Boot is on) and installed
+# separately with `s5-boot-halt instalar`, and that is why that is stated too.
+paso "systemd-boot route for the rare case"
 salida_boot="$(bash system/bin/s5-descubre-boot 2>&1)"; rc_boot=$?
 printf '%s\n' "$salida_boot" | sed 's/^/   /'
 if [ "${S5_BOOT_RUTA:-app}" = builtin ]; then
-    echo "   RUTA builtin: apaga la entrada integrada del cargador ('Power Off The System')."
-    echo "         No hay aplicacion EFI que compilar, firmar ni instalar, y armar solo"
-    echo "         escribe una variable EFI: la ESP no se toca en la ventana de apagado."
-    echo "         Requiere 'auto-poweroff yes' en loader.conf (systemd 255+)."
+    echo "   builtin ROUTE: it powers off with the boot loader's built-in entry ('Power Off The System')."
+    echo "         There is no EFI application to build, sign or install, and arming only"
+    echo "         writes an EFI variable: the ESP is not touched in the poweroff window."
+    echo "         Requires 'auto-poweroff yes' in loader.conf (systemd 255+)."
 elif [ "$rc_boot" = 0 ] && [ ! -e /boot/EFI/s5-halt/s5-halt.efi ]; then
-    echo "   NOTA: falta la aplicacion EFI; el caso raro seguira sin salvavidas hasta"
-    echo "         'sudo s5-boot-halt instalar' (necesita gnu-efi y, con Secure Boot, firmarla)."
+    echo "   NOTE: the EFI application is missing; the rare case will stay without a lifeline until"
+    echo "         'sudo s5-boot-halt instalar' (needs gnu-efi and, with Secure Boot, signing it)."
 fi
 
 # --- 2. las piezas del arreglo ----------------------------------------------

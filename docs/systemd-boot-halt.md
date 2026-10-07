@@ -75,7 +75,7 @@ machines:
   even the witness—: without that marker, telling "the application ran" from "the firmware
   rebooted and nobody noticed" depends on the memory of whoever ran the rehearsal, and that is
   not evidence. `s5-boot-halt estado` reads it and translates it to local time
-  (`ultimo apagado : SI, por firmware, el 2026-10-06 13:50:24 CST`), `armar` deletes it so that
+  (`last poweroff  : YES, by firmware, on 2026-10-06 13:50:24 CST`), `armar` deletes it so that
   what is read belongs to that rehearsal, and `uninstall.sh` takes it away. The application also
   prints the `EFI_STATUS` in hexadecimal when something fails: that number on screen is the only
   clue left. The console of a real rehearsal, in

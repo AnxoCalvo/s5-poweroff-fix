@@ -1,77 +1,78 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * s5-halt.efi — apagar desde el FIRMWARE, sin kernel de por medio.
+ * s5-halt.efi — power the machine off from the FIRMWARE, with no kernel involved.
  *
- * PARA QUE. En esta casa el caso raro (la dGPU no se duerme y el S5 saldria a
- * ~19 W) se cubre apagando desde GRUB con `halt`: en ESE arranque no llega a
- * ejecutarse ningun kernel de Linux, el firmware hace su propio S5 con el
- * hardware tal y como lo dejo el POST, y la medida sale limpia (1,05 W). En una
- * maquina con systemd-boot no hay `halt` que valga, y esto es el equivalente:
- * una aplicacion EFI de tres instrucciones que systemd-boot arranca como
- * cualquier otra entrada, con `bootctl set-oneshot` para que sea de un solo uso.
+ * WHY. In this project the rare case (the dGPU does not fall asleep and S5 would
+ * come out at ~19 W) is covered by powering off from GRUB with `halt`: in THAT
+ * boot no Linux kernel ever runs, the firmware does its own S5 with the hardware
+ * exactly as POST left it, and the measurement comes out clean (1.05 W). On a
+ * machine with systemd-boot there is no `halt` to be had, and this is the
+ * equivalent: a three-instruction EFI application that systemd-boot starts like
+ * any other entry, with `bootctl set-oneshot` to make it one-shot.
  *
- * POR QUE NO VALE HACERLO DESDE EL KERNEL, que seria mas comodo. Ya se midio y
- * esta en docs/EVIDENCE.md: un modulo que llama a ResetSystem por EFI desde un
- * kernel vivo deja el S5 en 19,26 W, y escribir PM1a_CNT a mano sin `_PTS(5)` ni
- * `device_shutdown()` lo deja en 26,56 W. Lo que salva la medida no es "apagar
- * por el firmware" sino que no haya llegado a arrancar un kernel: asi la dGPU
- * nunca se enciende y no hay riel que cortar.
+ * WHY DOING IT FROM THE KERNEL IS NOT EQUIVALENT, which would be more convenient.
+ * It has been measured and it is in docs/EVIDENCE.md: a module that calls
+ * ResetSystem through EFI from a live kernel leaves S5 at 19.26 W, and writing
+ * PM1a_CNT by hand without `_PTS(5)` or `device_shutdown()` leaves it at 26.56 W.
+ * What saves the measurement is not "powering off through the firmware" but that
+ * no kernel ever got to boot: that way the dGPU never wakes up and there is no
+ * rail to cut.
  *
- * SIN LIBRERIA, A PROPOSITO: solo se usan las cabeceras de gnu-efi (los tipos y
- * la tabla de sistema), no libefi ni libgnuefi. Son treinta lineas y no hay nada
- * que una libreria aporte aqui; a cambio, el mismo fuente se puede compilar por
- * las DOS vias conocidas, que no estan disponibles en las mismas maquinas:
+ * NO LIBRARY, ON PURPOSE: only the gnu-efi headers are used (the types and the
+ * system table), not libefi or libgnuefi. It is thirty lines and there is nothing
+ * a library would add here; in exchange, the same source builds through the TWO
+ * known routes, which are not available on the same machines:
  *
- *   gnu-efi + objcopy con efi-app-x86_64   (lo normal; ver system/efi/Makefile)
+ *   gnu-efi + objcopy with efi-app-x86_64   (the normal one; see system/efi/Makefile)
  *   clang --target=x86_64-pc-win32-coff + lld-link /subsystem:efi_application
  *
- * La segunda es la que hace falta cuando el binutils de la distribucion no trae
- * el objetivo EFI (comprobarlo: `objcopy --info | grep efi-app-x86_64`). En la
- * maquina donde se escribio esto pasa justo eso, y con clang+lld sale una imagen
- * PE valida y mas pequena. Las dos estan documentadas en docs/systemd-boot-halt.md.
+ * The second is the one needed when the distribution's binutils does not carry the
+ * EFI target (check it with `objcopy --info | grep efi-app-x86_64`). On the machine
+ * where this was written that is exactly the case, and clang+lld produces a valid
+ * and smaller PE image. Both are documented in docs/systemd-boot-halt.md.
  *
- * ANTI-BUCLE. Borra la variable EFI `LoaderEntryOneShot` antes de llamar a
- * ResetSystem, como segunda barrera: la primera es el propio cargador, que la
- * consume al usar la entrada (medido el 2026-10-06: con el apagado hecho, el
- * borrado de aqui devolvio error porque systemd-boot ya se la habia llevado). Las
- * dos apuntan a lo mismo —si el firmware no llegara a apagarse, o si ResetSystem
- * volviera, el arranque siguiente es el normal—, y el fichero de la entrada se
- * queda en la ESP a proposito: una vez consumida la variable es una entrada mas
- * del menu, y la barre el uninstall.sh, como ya hace la rama de GRUB con su
- * custom.cfg.
+ * ANTI-LOOP. It deletes the `LoaderEntryOneShot` EFI variable before calling
+ * ResetSystem, as a second barrier: the first is the boot loader itself, which
+ * consumes it when it uses the entry (measured on 2026-10-06: with the poweroff
+ * already done, the delete here returned an error because systemd-boot had taken
+ * it first). Both point at the same thing — if the firmware did not power off, or
+ * if ResetSystem returned, the next boot is the normal one — and the entry's file
+ * stays on the ESP on purpose: once the variable is consumed it is just another
+ * menu entry, and uninstall.sh sweeps it, exactly as the GRUB branch already does
+ * with its custom.cfg.
  *
- * DILO EN VOZ ALTA. Todo lo que pasa aqui se imprime en la consola del firmware,
- * que es el unico sitio donde puede quedar constancia: en ese arranque no hay
- * kernel, asi que no hay journal, ni dmesg, ni testigo. Por eso se escribe tambien
- * la marca de ejecucion (ver marcar()).
+ * SAY IT OUT LOUD. Everything that happens here is printed to the firmware
+ * console, which is the only place anything can be recorded: in that boot there is
+ * no kernel, so there is no journal, no dmesg, no witness. That is why the
+ * run marker is written too (see marcar()).
  *
- * FALLO SEGURO, SIEMPRE. Si no hay ResetSystem, o si vuelve sin apagar, esto
- * devuelve EFI_SUCCESS y systemd-boot sigue con su menu y su entrada por defecto:
- * se pierde el ahorro de ese apagado, no el arranque.
+ * FAIL SAFE, ALWAYS. If there is no ResetSystem, or if it returns without powering
+ * off, this returns EFI_SUCCESS and systemd-boot carries on with its menu and its
+ * default entry: what is lost is that poweroff's saving, not the boot.
  *
- * FIRMA. Con Secure Boot activado el firmware solo carga imagenes firmadas por
- * una clave que conozca. Esta hay que firmarla (tools/s5-boot-halt lo hace con
- * sbctl si las claves del usuario estan donde se esperan). Sin firmar,
- * systemd-boot no la carga, se queda en el menu y arranca lo de siempre: no rompe
- * nada, pero tampoco ahorra — por eso la instalacion lo comprueba y lo avisa.
+ * SIGNING. With Secure Boot enabled the firmware only loads images signed by a key
+ * it knows. This one has to be signed (tools/s5-boot-halt does it with sbctl if the
+ * user's keys are where they are expected). Unsigned, systemd-boot will not load
+ * it, stays in the menu and boots the usual thing: nothing breaks, but nothing is
+ * saved either - which is why the installation checks it and says so.
  *
- * SE DEJA VER. Antes de apagar escribe en `S5HaltLastRun` (GUID propio) la hora
- * del firmware: un apagado desde el cargador no deja log del kernel, asi que sin
- * esa marca no hay forma de distinguir "la aplicacion se ejecuto" de "el firmware
- * reinicio y nadie se entero". `s5-boot-halt estado` la lee y `armar` la borra,
- * de modo que lo que se lee es de ESTE ensayo.
+ * IT SHOWS ITSELF. Before powering off it writes the firmware's time into
+ * `S5HaltLastRun` (its own GUID): a poweroff from the boot loader leaves no kernel
+ * log, so without that marker there is no way to tell "the application ran" from
+ * "the firmware rebooted and nobody noticed". `s5-boot-halt estado` reads it and
+ * `armar` deletes it, so what is read belongs to THIS rehearsal.
  */
 
 #include <efi.h>
 
-/* El GUID de systemd para las variables Loader*: el mismo que aparece en
+/* systemd's GUID for the Loader* variables: the same one that shows up in
  * /sys/firmware/efi/efivars/LoaderEntryOneShot-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f */
 static EFI_GUID loader_guid = {
 	0x4a67b082, 0x0a4c, 0x41cf,
 	{ 0xb6, 0xc7, 0x44, 0x0b, 0x29, 0xbb, 0x8c, 0x4f }
 };
 
-/* GUID propio para la marca de ejecucion. En efivarfs la variable aparece como
+/* This project's own GUID for the run marker. In efivarfs the variable appears as
  * S5HaltLastRun-8b8c1b5e-2f1a-4b3c-9a7d-512c6e0a3f11 */
 static EFI_GUID s5_guid = {
 	0x8b8c1b5e, 0x2f1a, 0x4b3c,
@@ -79,9 +80,9 @@ static EFI_GUID s5_guid = {
 };
 
 /*
- * Un Print() propio en vez del de libefi: se llama al servicio de consola de la
- * tabla de sistema, que es lo unico que hace falta. Si no hubiera consola, se
- * calla en vez de caerse — el apagado no depende de poder contar nada.
+ * Its own Print() instead of libefi's: it calls the system table's console
+ * service, which is all that is needed. Without a console it stays quiet instead
+ * of crashing - the poweroff does not depend on being able to tell anyone.
  */
 static void decir(EFI_SYSTEM_TABLE *st, CHAR16 *texto)
 {
@@ -89,8 +90,8 @@ static void decir(EFI_SYSTEM_TABLE *st, CHAR16 *texto)
 		st->ConOut->OutputString(st->ConOut, texto);
 }
 
-/* Un EFI_STATUS en hexadecimal: si algo falla, ese numero es la unica pista que
- * queda en pantalla, y "no pude borrar X" sin el codigo obliga a adivinar. */
+/* An EFI_STATUS in hexadecimal: if something fails, that number is the only clue
+ * left on screen, and "could not delete X" without the code forces guessing. */
 static void decir_status(EFI_SYSTEM_TABLE *st, EFI_STATUS rc)
 {
 	static const char hex[] = "0123456789ABCDEF";
@@ -106,14 +107,15 @@ static void decir_status(EFI_SYSTEM_TABLE *st, EFI_STATUS rc)
 }
 
 /*
- * MARCA DE EJECUCION. Un apagado desde el cargador no deja NINGUN log del kernel:
- * ni journal, ni dmesg, ni el testigo. Sin algo escrito desde aqui, saber si el
- * ensayo paso depende de la memoria de quien lo hizo, y eso no vale como
- * evidencia. Se deja la hora del firmware en una variable propia; la lee
- * `s5-boot-halt estado` y la borra `armar`, de modo que su contenido habla del
- * ultimo ensayo y no de uno cualquiera.
+ * RUN MARKER. A poweroff from the boot loader leaves NO kernel log at all: no
+ * journal, no dmesg, no witness. Without something written from here, knowing
+ * whether the rehearsal worked depends on the memory of whoever ran it, and that
+ * is not evidence. The firmware's time is left in a variable of its own;
+ * `s5-boot-halt estado` reads it and `armar` deletes it, so its content speaks of
+ * the last rehearsal and not of any other one.
  *
- * NO ES CRITICO: si esto falla se avisa por consola y el apagado sigue.
+ * IT IS NOT CRITICAL: if this fails it says so on the console and the poweroff
+ * continues.
  */
 static EFI_STATUS marcar(EFI_SYSTEM_TABLE *st)
 {
@@ -144,10 +146,10 @@ static EFI_STATUS marcar(EFI_SYSTEM_TABLE *st)
 	iso[i++] = ':';
 	DIG2(t.Second);
 #undef DIG2
-	/* La RTC de esta maquina va en UTC (timedatectl: RTC time = Universal time),
-	 * asi que la hora del firmware se guarda tal cual y con la Z: quien la lea
-	 * sabe que es UTC y la traduce. El 2026-10-06 se guardo "05:50:24" para un
-	 * apagado de las 13:50 locales, y ese despiste es el que evita la Z. */
+	/* This machine's RTC runs in UTC (timedatectl: RTC time = Universal time),
+	 * so the firmware's time is stored as it comes and with the Z: whoever reads
+	 * it knows it is UTC and translates. On 2026-10-06 "05:50:24" was stored for
+	 * a poweroff at 13:50 local, and that confusion is what the Z prevents. */
 	iso[i++] = 'Z';
 	iso[i] = '\0';
 
@@ -160,7 +162,7 @@ static EFI_STATUS marcar(EFI_SYSTEM_TABLE *st)
 					      EFI_VARIABLE_RUNTIME_ACCESS,
 					      (UINTN)(i + 1) * sizeof(CHAR16), buf);
 	if (!EFI_ERROR(rc)) {
-		decir(st, L"s5-halt: marca de ejecucion en S5HaltLastRun (");
+		decir(st, L"s5-halt: run marker written to S5HaltLastRun (");
 		decir(st, buf);
 		decir(st, L")\r\n");
 	}
@@ -173,48 +175,49 @@ EFI_STATUS efi_main(EFI_HANDLE imagen, EFI_SYSTEM_TABLE *st)
 
 	(void)imagen;
 
-	decir(st, L"s5-halt: apagando desde el firmware, sin kernel de por medio...\r\n");
+	decir(st, L"s5-halt: powering off from the firmware, no kernel involved...\r\n");
 
 	if (!st || !st->RuntimeServices) {
-		decir(st, L"s5-halt: no hay servicios de runtime; vuelvo al menu\r\n");
+		decir(st, L"s5-halt: no runtime services; going back to the menu\r\n");
 		return EFI_SUCCESS;
 	}
 
 	/*
-	 * ANTI-BUCLE, y de paso una medicion. El 2026-10-06, con la entrada
-	 * consumida y el apagado hecho, este borrado devolvio error: systemd-boot
-	 * ya habia borrado LoaderEntryOneShot al usarla (la variable "es para el
-	 * arranque siguiente", y el cargador la consume). O sea que esta llamada es
-	 * una segunda barrera, no la unica, y el aviso de antes ("si esto no apaga,
-	 * el proximo arranque puede repetirlo") era demasiado alarmante para un
-	 * caso normal. Ahora se dice el codigo y lo que significa.
+	 * ANTI-LOOP, and a measurement in passing. On 2026-10-06, with the entry
+	 * consumed and the poweroff done, this delete returned an error: systemd-boot
+	 * had already deleted LoaderEntryOneShot when it used it (the variable "is for
+	 * the next boot", and the boot loader consumes it). So this call is a second
+	 * barrier, not the only one, and the earlier warning ("if this does not power
+	 * off, the next boot may repeat it") was too alarming for a normal case. Now
+	 * the code and what it means are stated.
 	 */
 	rc = st->RuntimeServices->SetVariable(L"LoaderEntryOneShot", &loader_guid,
 					      0, 0, NULL);
 	if (EFI_ERROR(rc)) {
-		decir(st, L"s5-halt: LoaderEntryOneShot ya no estaba (status ");
+		decir(st, L"s5-halt: LoaderEntryOneShot was already gone (status ");
 		decir_status(st, rc);
-		decir(st, L"); el cargador la consume al usar la entrada, asi que\r\n");
-		decir(st, L"         el arranque siguiente es el normal aunque esto no apague\r\n");
+		decir(st, L"); the boot loader consumes it when it uses the entry, so\r\n");
+		decir(st, L"         the next boot is the normal one even if this does not power off\r\n");
 	}
 
-	/* La marca va despues del borrado: asi, si el apagado ocurre, lo que queda
-	 * escrito es "la aplicacion llego hasta aqui", no "alguien la armo". */
+	/* The marker goes after the delete: that way, if the poweroff happens, what
+	 * is written says "the application got this far", not "somebody armed it". */
 	rc = marcar(st);
 	if (EFI_ERROR(rc))
-		decir(st, L"s5-halt: aviso: no pude dejar la marca de ejecucion (no afecta al apagado)\r\n");
+		decir(st, L"s5-halt: warning: could not leave the run marker (does not affect the poweroff)\r\n");
 
 	if (!st->RuntimeServices->ResetSystem) {
-		decir(st, L"s5-halt: este firmware no ofrece ResetSystem; vuelvo al menu (arranque normal)\r\n");
+		decir(st, L"s5-halt: this firmware does not offer ResetSystem; going back to the menu (normal boot)\r\n");
 		return EFI_SUCCESS;
 	}
 
 	st->RuntimeServices->ResetSystem(EfiResetShutdown, EFI_SUCCESS, 0, NULL);
 
 	/*
-	 * Si se llega aqui, ResetSystem volvio sin apagar. Un arranque normal es
-	 * mejor que un cuelgue: se dice y se devuelve el control al cargador.
+	 * If this is reached, ResetSystem returned without powering off. A normal
+	 * boot is better than a hang: it says so and returns control to the boot
+	 * loader.
 	 */
-	decir(st, L"s5-halt: ResetSystem volvio sin apagar; vuelvo al menu (arranque normal)\r\n");
+	decir(st, L"s5-halt: ResetSystem returned without powering off; going back to the menu (normal boot)\r\n");
 	return EFI_SUCCESS;
 }

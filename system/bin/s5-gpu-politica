@@ -224,26 +224,26 @@ say "POLITICA !!! la dGPU NO cayo a D3cold en ${t}s (traza: $traza)" \
     "POLITICA estado: $(estado)" \
     "POLITICA => el apagado normal costaria ~19 W; hay que apagar sin que llegue a correr un kernel"
 
-# --- 2a. sin GRUB con el que desviar, la via de systemd-boot ----------------
-# Se decide AQUI y no despues de montar /boot: de nada sirve montarlo para
-# escribir un custom.cfg en una maquina que arranca con systemd-boot. Si la via
-# de systemd-boot esta y funciona, reinicia ella y esto termina; si no, se sigue
-# con la rama de GRUB de abajo, que no cambia una linea.
+# --- 2a. no GRUB to divert through, the systemd-boot route ------------------
+# This is decided HERE and not after mounting /boot: there is no point mounting it to
+# write a custom.cfg on a machine that boots with systemd-boot. If the systemd-boot
+# route is there and works, it reboots and this ends; if not, it continues
+# with the GRUB branch below, which does not change a line.
 #
-# Las dos vias hacen lo mismo por caminos distintos: apagar desde el firmware sin
-# que llegue a ejecutarse un kernel (GRUB con `halt`; systemd-boot con una entrada
-# de un solo uso que apunta a `s5-halt.efi` o a la integrada del cargador).
-# El porque esta en docs/systemd-boot-halt.md.
+# Both routes do the same thing by different paths: power off from the firmware without
+# a kernel ever getting to run (GRUB with `halt`; systemd-boot with a one-shot
+# entry that points to `s5-halt.efi` or to the boot loader's built-in one).
+# The reason is in docs/systemd-boot-halt.md.
 if [ -z "$GRUB_REBOOT" ] || [ -z "$GRUB_EDITENV" ]; then
     POLITICA_BOOT=${S5_POLITICA_BOOT:-/usr/local/bin/s5-politica-boot}
-    say "POLITICA sin GRUB utilizable (reboot='${GRUB_REBOOT:-}' editenv='${GRUB_EDITENV:-}'): probando la via de systemd-boot"
+    say "POLITICA no usable GRUB (reboot='${GRUB_REBOOT:-}' editenv='${GRUB_EDITENV:-}'): trying the systemd-boot route"
     if [ -x "$POLITICA_BOOT" ]; then
         if S5_POLITICA_LOG="$LOG" "$POLITICA_BOOT"; then
-            exit 0        # reinicia dentro; el exit es por si volviera
+            exit 0        # it reboots inside; the exit is in case it came back
         fi
-        say "POLITICA la via de systemd-boot tampoco pudo; sigue el camino de siempre"
+        say "POLITICA the systemd-boot route could not either; the usual path continues"
     else
-        say "POLITICA falta $POLITICA_BOOT (lo instala install.sh): sigue el camino de siempre"
+        say "POLITICA missing $POLITICA_BOOT (installed by install.sh): the usual path continues"
     fi
 fi
 

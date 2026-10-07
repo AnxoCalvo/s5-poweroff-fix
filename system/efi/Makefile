@@ -1,19 +1,19 @@
-# system/efi/Makefile — compila s5-halt.efi.
+# system/efi/Makefile — builds s5-halt.efi.
 #
-# DOS VIAS, porque no estan disponibles en las mismas maquinas:
+# TWO ROUTES, because they are not available on the same machines:
 #
-#   make            gnu-efi + objcopy con el objetivo `efi-app-x86_64`
+#   make            gnu-efi + objcopy with the `efi-app-x86_64` target
 #   make clang      clang (--target=x86_64-pc-win32-coff) + lld-link
-#   make check      dice cual de las dos esta disponible aqui, o por que no hay
+#   make check      says which of the two is available here, or why neither is
 #
-# La segunda existe porque hay binutils sin el objetivo EFI (comprobarlo:
-# `objcopy --info | grep efi-app-x86_64`); en la maquina donde se escribio esto es
-# el caso, y con clang+lld sale una imagen PE valida y mas pequena. El fuente no
-# usa la libreria de gnu-efi (solo sus cabeceras), asi que las dos vias compilan
-# exactamente el mismo codigo.
+# The second one exists because some binutils lack the EFI target (check it:
+# `objcopy --info | grep efi-app-x86_64`); on the machine where this was written
+# that is the case, and clang+lld produces a valid and smaller PE image. The
+# source does not use the gnu-efi library (only its headers), so both routes
+# compile exactly the same code.
 #
-# Rutas sobreescribibles porque no todas las distribuciones las ponen igual
-# (Fedora en /usr/lib/gnuefi y /usr/lib64, Debian y Arch en /usr/lib).
+# Overridable paths because not all distributions put them in the same place
+# (Fedora in /usr/lib/gnuefi and /usr/lib64, Debian and Arch in /usr/lib).
 
 EFIINC  ?= /usr/include/efi
 EFILIB  ?= /usr/lib
@@ -26,17 +26,17 @@ OBJCOPY ?= objcopy
 CLANG   ?= clang
 LLDLINK ?= lld-link
 
-# -fshort-wchar: los literales L"..." de EFI son de 16 bits.
-# -mno-red-zone: el firmware puede usar interrupciones y no respeta la red zone.
-# -DEFI_FUNCTION_WRAPPER: obliga a pasar por uefi_call_wrapper, que es lo que
-#   hace portable la llamada a los servicios de arranque y de runtime.
+# -fshort-wchar: EFI's L"..." literals are 16-bit.
+# -mno-red-zone: the firmware may use interrupts and does not respect the red zone.
+# -DEFI_FUNCTION_WRAPPER: forces calls through uefi_call_wrapper, which is what
+#   makes calling the boot and runtime services portable.
 CFLAGS  += -I$(EFIINC) -I$(EFIINC)/x86_64 -I$(EFIINC)/protocol \
 	   -fno-stack-protector -fpic -fshort-wchar -mno-red-zone \
 	   -Wall -Wextra -O2 -DEFI_FUNCTION_WRAPPER
 LDFLAGS += -nostdlib -znocombreloc -T $(LDSCRIPT) -shared -Bsymbolic \
 	   -L$(EFILIB) $(CRTOBJ)
-# La via de clang no usa EFI_FUNCTION_WRAPPER: el objetivo win32-coff ya usa la
-# convencion de llamada de EFI, y la libreria no se enlaza.
+# The clang route does not use EFI_FUNCTION_WRAPPER: the win32-coff target already
+# uses the EFI calling convention, and the library is not linked.
 CLANGFLAGS += -I$(EFIINC) -I$(EFIINC)/x86_64 -I$(EFIINC)/protocol \
 	      -fno-stack-protector -fshort-wchar -mno-red-zone \
 	      -ffreestanding -nostdlib -Wall -Wextra -O2
@@ -47,25 +47,25 @@ check:
 	@ok=0; \
 	if [ -e "$(CRTOBJ)" ] && [ -e "$(LDSCRIPT)" ] && \
 	   $(OBJCOPY) --info 2>/dev/null | tr ' ' '\n' | grep -qx 'efi-app-x86_64'; then \
-		echo "via gnu-efi + objcopy (efi-app-x86_64): LISTA"; ok=1; \
+		echo "gnu-efi + objcopy route (efi-app-x86_64): READY"; ok=1; \
 	else \
-		echo "via gnu-efi + objcopy: no (falta gnu-efi o el objetivo efi-app-x86_64)"; \
+		echo "gnu-efi + objcopy route: no (missing gnu-efi or the efi-app-x86_64 target)"; \
 	fi; \
 	if command -v $(CLANG) >/dev/null 2>&1 && command -v $(LLDLINK) >/dev/null 2>&1; then \
 		if [ -e "$(EFIINC)/efi.h" ]; then \
-			echo "via clang + lld-link: LISTA (cabeceras de gnu-efi en $(EFIINC))"; ok=1; \
+			echo "clang + lld-link route: READY (gnu-efi headers in $(EFIINC))"; ok=1; \
 		else \
-			echo "via clang + lld-link: falta solo las cabeceras, no la libreria -> instala gnu-efi"; \
-			echo "   ($(EFIINC)/efi.h no existe; sin el, clang falla con: 'efi.h' file not found)"; \
+			echo "clang + lld-link route: only the headers are missing, not the library -> install gnu-efi"; \
+			echo "   ($(EFIINC)/efi.h does not exist; without it, clang fails with: 'efi.h' file not found)"; \
 		fi; \
 	else \
-		echo "via clang + lld-link: no (falta clang o lld-link)"; \
+		echo "clang + lld-link route: no (missing clang or lld-link)"; \
 	fi; \
 	if [ "$$ok" = 0 ]; then \
 		echo; \
-		echo "No hay ninguna via para construir la imagen EFI. Instala una de las dos:"; \
-		echo "  Arch:   sudo pacman -S gnu-efi          (y comprueba el objcopy de arriba)"; \
-		echo "          sudo pacman -S clang lld        (si tu binutils no trae el objetivo EFI)"; \
+		echo "There is no route to build the EFI image. Install one of the two:"; \
+		echo "  Arch:   sudo pacman -S gnu-efi          (and check the objcopy output above)"; \
+		echo "          sudo pacman -S clang lld        (if your binutils does not carry the EFI target)"; \
 		echo "  Fedora: sudo dnf install gnu-efi"; \
 		exit 1; \
 	fi
@@ -82,7 +82,7 @@ s5-halt.efi: s5-halt.so
 		--target=efi-app-x86_64 $< $@
 	@ls -l $@
 
-# La via alternativa produce el mismo $@ desde el mismo fuente.
+# The alternative route produces the same $@ from the same source.
 clang: s5-halt-clang.o
 	$(LLDLINK) /subsystem:efi_application /entry:efi_main /nodefaultlib \
 		/out:s5-halt.efi $<

@@ -1,31 +1,31 @@
 #!/bin/bash
-# s5-boot-halt — el equivalente del `halt` de GRUB en una maquina con
-# systemd-boot: compila e instala la aplicacion EFI de apagado, y arma la entrada
-# de un solo uso para el proximo apagado.
+# s5-boot-halt — the equivalent of GRUB's `halt` on a machine with
+# systemd-boot: it builds and installs the EFI poweroff application, and arms the
+# one-shot entry for the next poweroff.
 #
-# POR QUE EXISTE. La rama del caso raro de s5-gpu-politica apaga desde GRUB
-# porque en ese arranque no llega a ejecutarse un kernel de Linux: el firmware
-# hace su S5 con el hardware tal y como lo dejo el POST, y la medida sale limpia
-# (1,05 W medidos el 2026-08-09). Aqui no hay GRUB, asi que el mismo truco se hace
-# con una entrada de un solo uso que arranca system/efi/s5-halt.c. El porque de
-# que NO valga hacerlo desde un kernel vivo esta en docs/EVIDENCE.md
-# (`efi-poweroff` 19,26 W; `pm1a-acpica` 26,56 W): lo que salva la medida no es
-# apagar por el firmware, es que no haya kernel.
+# WHY IT EXISTS. The rare-case branch of s5-gpu-politica powers off from GRUB
+# because in that boot no Linux kernel ever gets to run: the firmware
+# does its S5 with the hardware just as POST left it, and the measurement comes out clean
+# (1,05 W measured on 2026-08-09). Here there is no GRUB, so the same trick is done
+# with a one-shot entry that boots system/efi/s5-halt.c. The reason why
+# it does NOT work to do it from a live kernel is in docs/EVIDENCE.md
+# (`efi-poweroff` 19,26 W; `pm1a-acpica` 26,56 W): what saves the measurement is not
+# powering off through the firmware, it is that there is no kernel.
 #
-# Uso:
-#   sudo s5-boot-halt estado      (por defecto) que hay y si esta armado
-#   sudo s5-boot-halt instalar    compila, firma e instala app + entrada en la ESP
-#   sudo s5-boot-halt armar       deja la entrada de un solo uso para el proximo apagado
-#   sudo s5-boot-halt abortar     la quita (por si te arrepientes antes de apagar)
+# Usage:
+#   sudo s5-boot-halt estado      (default) what is there and whether it is armed
+#   sudo s5-boot-halt instalar    builds, signs and installs app + entry on the ESP
+#   sudo s5-boot-halt armar       leaves the one-shot entry for the next poweroff
+#   sudo s5-boot-halt abortar     removes it (in case you change your mind before powering off)
 #
-# FALLO SEGURO, SIEMPRE. Todo lo que falte se dice con nombre y apellido y la
-# orden no se lleva a cabo: sin gnu-efi no se compila, sin firma no se instala con
-# Secure Boot activado, sin efivarfs no se arma. En todos esos casos el apagado
-# sigue por el camino normal y solo se pierde el ahorro.
+# FAIL SAFE, ALWAYS. Everything missing is named outright and the
+# order is not carried out: without gnu-efi it does not build, without a signature it is not installed with
+# Secure Boot enabled, without efivarfs it is not armed. In all those cases the poweroff
+# continues along the normal path and only the saving is lost.
 #
-# NO TOCA NINGUN ARRANQUE QUE YA EXISTA: anade una entrada nueva a la ESP y una
-# variable EFI; no cambia el cargador, ni el kernel, ni ninguna entrada previa.
-# `abortar` y el uninstall.sh lo dejan como estaba.
+# IT TOUCHES NO BOOT THAT ALREADY EXISTS: it adds a new entry to the ESP and an EFI
+# variable; it does not change the boot loader, the kernel, or any previous entry.
+# `abortar` and uninstall.sh leave it as it was.
 
 set -u
 
@@ -34,8 +34,8 @@ S5_CONF=${S5_CONF:-/etc/s5-poweroff-fix.conf}
 LOG=${S5_BOOT_LOG:-/var/log/s5-shutdown-pci.log}
 # shellcheck source=/dev/null
 . "$HERE/system/bin/s5-descubre-boot" 2>/dev/null || {
-    # Si el descubridor no esta donde se le espera, se busca en su sitio de
-    # instalacion: el modulo y la politica ya viven en /usr/local/bin.
+    # If the discovery script is not where it is expected, it is looked for in its
+    # installation location: the module and the policy already live in /usr/local/bin.
     # shellcheck source=/dev/null
     . /usr/local/bin/s5-descubre-boot
 }
@@ -43,12 +43,12 @@ LOG=${S5_BOOT_LOG:-/var/log/s5-shutdown-pci.log}
 say() { printf 'BOOT  %s\n' "$*"; printf 'BOOT  %s\n' "$*" >>"$LOG" 2>/dev/null || true; }
 
 exigir_root() {
-    [ "$(id -u)" = 0 ] || { echo "error: esta orden escribe en la ESP y en efivarfs; usa sudo" >&2; exit 1; }
+    [ "$(id -u)" = 0 ] || { echo "error: this command writes to the ESP and to efivarfs; use sudo" >&2; exit 1; }
 }
 
-# Un limite del descubridor no siempre es un limite para ESTA orden: sin la
-# aplicacion instalada, `armar` no sirve pero `instalar` si. Se comprueba aparte.
-limite_para() {   # $1 = lo que se quiere hacer
+# A limit of the discovery script is not always a limit for THIS order: without the
+# application installed, `armar` does not work but `instalar` does. It is checked separately.
+limite_para() {   # $1 = what is to be done
     case "$1" in
     instalar) [ -n "$BOOT_ESP" ] && [ -n "$BOOT_BOOTCTL" ] ;;
     armar)    [ -n "$BOOT_ESP" ] && [ -n "$BOOT_BOOTCTL" ] && [ "$BOOT_ONESHOT" = si ] \
@@ -56,9 +56,9 @@ limite_para() {   # $1 = lo que se quiere hacer
     esac
 }
 
-# La marca que deja la aplicacion al ejecutarse (ver system/efi/s5-halt.c). El
-# nombre en efivarfs lleva el GUID propio; los 4 primeros bytes del fichero son los
-# atributos de la variable, no su contenido.
+# The marker the application leaves when it runs (see system/efi/s5-halt.c). The
+# name in efivarfs carries its own GUID; the first 4 bytes of the file are the
+# variable's attributes, not its content.
 MARCA_NOMBRE=S5HaltLastRun
 MARCA_GUID=8b8c1b5e-2f1a-4b3c-9a7d-512c6e0a3f11
 marca_path() { printf '%s/%s-%s' "$BOOT_EFIVARS" "$MARCA_NOMBRE" "$MARCA_GUID"; }
@@ -67,8 +67,8 @@ marca_valor() {
     [ -e "$v" ] || return 1
     tail -c +5 <"$v" 2>/dev/null | tr -d '\0'
 }
-# Las variables EFI son inmutables (----i----); hay que quitarles el atributo antes
-# de borrarlas, que es lo que hace bootctl por dentro.
+# EFI variables are immutable (----i----); the attribute has to be removed before
+# deleting them, which is what bootctl does internally.
 borrar_var() {
     [ -e "$1" ] || return 0
     chattr -i "$1" 2>/dev/null || true
@@ -76,64 +76,64 @@ borrar_var() {
 }
 
 estado() {
-    printf 'ESP            : %s\n' "${BOOT_ESP:-(no encontrada)}"
-    printf 'bootctl        : %s\n' "${BOOT_BOOTCTL:-(no encontrado)}"
-    printf 'entrada 1 uso  : %s\n' "${BOOT_ONESHOT:-NO}"
-    printf 'Secure Boot    : %s\n' "${BOOT_SB:-(desactivado o desconocido)}"
-    printf 'aplicacion     : %s%s\n' "${BOOT_HALT_EFI:-(sin ESP)}" \
-        "$([ -n "$BOOT_HALT_EFI" ] && [ -e "$BOOT_HALT_EFI" ] && echo '  (instalada)' || echo '  (falta: s5-boot-halt instalar)')"
-    printf 'entrada        : %s%s\n' "${BOOT_HALT_ENTRY:-(sin ESP)}" \
-        "$([ -n "$BOOT_HALT_ENTRY" ] && [ -e "$BOOT_HALT_ENTRY" ] && echo '  (escrita)' || echo '  (falta: s5-boot-halt instalar)')"
+    printf 'ESP            : %s\n' "${BOOT_ESP:-(not found)}"
+    printf 'bootctl        : %s\n' "${BOOT_BOOTCTL:-(not found)}"
+    printf 'one-shot entry : %s\n' "${BOOT_ONESHOT:-NO}"
+    printf 'Secure Boot    : %s\n' "${BOOT_SB:-(disabled or unknown)}"
+    printf 'application    : %s%s\n' "${BOOT_HALT_EFI:-(no ESP)}" \
+        "$([ -n "$BOOT_HALT_EFI" ] && [ -e "$BOOT_HALT_EFI" ] && echo '  (installed)' || echo '  (missing: s5-boot-halt instalar)')"
+    printf 'entry          : %s%s\n' "${BOOT_HALT_ENTRY:-(no ESP)}" \
+        "$([ -n "$BOOT_HALT_ENTRY" ] && [ -e "$BOOT_HALT_ENTRY" ] && echo '  (written)' || echo '  (missing: s5-boot-halt instalar)')"
 
-    # El armado se lee de la variable, no de un fichero de estado nuestro: la
-    # unica verdad es la que va a leer systemd-boot al arrancar. Los 4 primeros
-    # bytes son los atributos de la variable en efivarfs, no su contenido.
+    # Arming is read from the variable, not from a state file of ours: the
+    # only truth is the one systemd-boot will read when it boots. The first 4
+    # bytes are the variable's attributes in efivarfs, not its content.
     v=$(ls -1 "$BOOT_EFIVARS"/LoaderEntryOneShot-* 2>/dev/null | head -1)
     if [ -n "${v:-}" ]; then
-        printf 'armado         : SI (%s)\n' "$(tail -c +5 <"$v" 2>/dev/null | tr -d '\0')"
+        printf 'armed          : YES (%s)\n' "$(tail -c +5 <"$v" 2>/dev/null | tr -d '\0')"
     else
-        printf 'armado         : no\n'
+        printf 'armed          : no\n'
     fi
     if [ -n "$BOOT_LIMITE" ]; then
-        printf 'limite         : %s\n' "$BOOT_LIMITE"
+        printf 'limit          : %s\n' "$BOOT_LIMITE"
     fi
 
-    # La prueba de que la aplicacion SE EJECUTO. No hay otra: el apagado ocurre
-    # sin kernel, asi que ni journal ni dmesg ni el testigo lo ven. La hora va en
-    # UTC (la RTC de esta maquina va en UTC y el firmware la da tal cual), asi que
-    # se traduce a la local: leer "05:50" para un apagado de las 13:50 es justo el
-    # despiste que esto evita.
+    # The proof that the application RAN. There is no other: the poweroff happens
+    # with no kernel, so neither journal nor dmesg nor the witness see it. The time is in
+    # UTC (this machine's RTC runs in UTC and the firmware gives it as is), so it
+    # is translated to local: reading "05:50" for a 13:50 poweroff is exactly the
+    # confusion this avoids.
     if marca=$(marca_valor); then
-        # La aplicacion actual escribe la Z; la primera version no la ponia, y su
-        # hora era UTC igualmente (el firmware da UTC). Se normaliza aqui para que
-        # una marca vieja no se lea como si fuera local.
+        # The current application writes the Z; the first version did not put it, and its
+        # time was UTC anyway (the firmware gives UTC). It is normalized here so that
+        # an old marker is not read as if it were local.
         case "$marca" in
         *Z) marca_utc=$marca ;;
         *)  marca_utc="${marca}Z" ;;
         esac
         marca_local=$(date -d "$marca_utc" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || true)
         if [ -n "$marca_local" ]; then
-            printf 'ultimo apagado : SI, por firmware, el %s (%s)\n' "$marca_local" "$marca"
+            printf 'last poweroff  : YES, by firmware, on %s (%s)\n' "$marca_local" "$marca"
         else
-            printf 'ultimo apagado : SI, por firmware, el %s\n' "$marca"
+            printf 'last poweroff  : YES, by firmware, on %s\n' "$marca"
         fi
     else
-        printf 'ultimo apagado : no consta que la aplicacion se haya ejecutado nunca\n'
+        printf 'last poweroff  : there is no record that the application has ever run\n'
     fi
 }
 
 instalar() {
     exigir_root
     if ! limite_para instalar; then
-        echo "no puedo instalar todavia: ${BOOT_LIMITE:-falta la ESP o bootctl}" >&2
+        echo "cannot install yet: ${BOOT_LIMITE:-missing the ESP or bootctl}" >&2
         return 1
     fi
 
-    echo "== 1. compilar =="
-    # `check` ya dice que via hay en esta maquina y por que no la otra. Elegir por su
-    # salida, en vez de intentar la que falta y caer al fallar, evita ensenar un error
-    # de objcopy que no es un error: aqui el binutils no trae el objetivo
-    # efi-app-x86_64, asi que la via de gnu-efi no puede dar el ultimo paso.
+    echo "== 1. build =="
+    # `check` already says which route there is on this machine and why not the other. Choosing by its
+    # output, instead of trying the one that is missing and falling back on failure, avoids showing an
+    # objcopy error that is not an error: here binutils does not carry the
+    # efi-app-x86_64 target, so the gnu-efi route cannot take the last step.
     if ! check_out=$(make -C "$HERE/system/efi" check 2>&1); then
         printf '%s\n' "$check_out" >&2
         return 1
@@ -141,77 +141,77 @@ instalar() {
     printf '%s\n' "$check_out"
     via=clang
     case "$check_out" in
-    *"via gnu-efi + objcopy (efi-app-x86_64): LISTA"*) via=gnu-efi ;;
+    *"gnu-efi + objcopy route (efi-app-x86_64): READY"*) via=gnu-efi ;;
     esac
     if [ "$via" = gnu-efi ]; then
         if ! make -C "$HERE/system/efi"; then
-            echo "la via gnu-efi fallo; probando clang + lld-link"
+            echo "the gnu-efi route failed; trying clang + lld-link"
             via=clang
             make -C "$HERE/system/efi" clang || return 1
         fi
     else
         make -C "$HERE/system/efi" clang || return 1
     fi
-    echo "compilado por la via: $via"
+    echo "built by route: $via"
 
     echo
-    echo "== 2. firmar (solo si hace falta) =="
+    echo "== 2. sign (only if needed) =="
     efi="$HERE/system/efi/s5-halt.efi"
     if [ "$BOOT_SB" = si ]; then
-        # La aplicacion la firma el usuario con SUS claves: este proyecto no
-        # instala claves ni toca la base de datos de Secure Boot.
+        # The application is signed by the user with THEIR keys: this project does
+        # not install keys or touch the Secure Boot database.
         if command -v sbctl >/dev/null 2>&1; then
-            sbctl sign -s "$efi" || { echo "sbctl sign fallo" >&2; return 1; }
+            sbctl sign -s "$efi" || { echo "sbctl sign failed" >&2; return 1; }
         elif command -v sbsign >/dev/null 2>&1; then
-            echo "sbsign encontrado, pero hacen falta las claves del usuario:" >&2
-            echo "  sbsign --key /ruta/db.key --cert /ruta/db.crt --output <efi> <efi>" >&2
-            echo "y volver a ejecutar 's5-boot-halt instalar'." >&2
+            echo "sbsign found, but the user's keys are needed:" >&2
+            echo "  sbsign --key /path/db.key --cert /path/db.crt --output <efi> <efi>" >&2
+            echo "and run 's5-boot-halt instalar' again." >&2
             return 1
         else
-            echo "Secure Boot activado y no hay ni sbctl ni sbsign: firmala a mano" >&2
+            echo "Secure Boot enabled and there is neither sbctl nor sbsign: sign it by hand" >&2
             return 1
         fi
     else
-        echo "Secure Boot desactivado: no hace falta firmar"
+        echo "Secure Boot disabled: no need to sign"
     fi
-    # La comprobacion que de verdad importa, con la herramienta que lo sabe:
+    # The check that really matters, with the tool that knows how to do it:
     if command -v sbctl >/dev/null 2>&1; then
         sbctl verify "$efi" 2>/dev/null | sed 's/^/  /' || true
     fi
 
     echo
-    echo "== 3. instalar en la ESP (nada existente se toca) =="
+    echo "== 3. install to the ESP (nothing existing is touched) =="
     install -d -m755 "$(dirname "$BOOT_HALT_EFI")" || return 1
     install -m644 "$efi" "$BOOT_HALT_EFI" || return 1
 
-    # La entrada se escribe UNA vez y se queda: asi armar un apagado es solo
-    # escribir una variable EFI, sin montar /boot ni escribir en la ESP durante
-    # la ventana de apagado (que es justo el problema que tiene la rama de GRUB).
+    # The entry is written ONCE and stays: that way arming a poweroff is only
+    # writing an EFI variable, without mounting /boot or writing to the ESP during
+    # the poweroff window (which is exactly the problem the GRUB branch has).
     cat >"$BOOT_HALT_ENTRY" <<'EOF'
-# s5-boot-halt — entrada de un solo uso, la arma `s5-boot-halt armar` y la
-# consume systemd-boot. NO se borra al usarla: sin la variable LoaderEntryOneShot
-# es una entrada mas del menu, y la barrera de verdad contra un bucle es que la
-# aplicacion borra esa variable antes de apagar.
-title   S5 — apagar desde el firmware (la dGPU no se durmio)
+# s5-boot-halt — one-shot entry, armed by `s5-boot-halt armar` and
+# consumed by systemd-boot. It is NOT deleted when used: without the LoaderEntryOneShot
+# variable it is just another menu entry, and the real barrier against a loop is that the
+# application deletes that variable before powering off.
+title   S5 — power off from the firmware (the dGPU did not fall asleep)
 efi     /EFI/s5-halt/s5-halt.efi
 EOF
     chmod 0644 "$BOOT_HALT_ENTRY" 2>/dev/null || true
     sync
-    say "instalado: $BOOT_HALT_EFI + $BOOT_HALT_ENTRY (Secure Boot=$BOOT_SB)"
+    say "installed: $BOOT_HALT_EFI + $BOOT_HALT_ENTRY (Secure Boot=$BOOT_SB)"
     echo
-    echo "instalado. Ahora: s5-boot-halt armar   (y apagar para probarlo)"
+    echo "installed. Now: s5-boot-halt armar   (and power off to test it)"
 }
 
 armar() {
     exigir_root
-    # La marca del ensayo ANTERIOR se borra aqui: asi lo que se lea despues es de
-    # este, y no hay que fiarse de cuando se corrio por ultima vez.
+    # The marker from the PREVIOUS rehearsal is deleted here: that way what is read afterwards is from
+    # this one, and there is no need to trust when it was last run.
     borrar_var "$(marca_path)"
-    # El armado vive en system/bin/s5-politica-boot, que es lo que llama la
-    # politica durante el apagado: UNA sola implementacion, y esta orden solo la
-    # usa para ensayar (--armar-solo = arma y NO reinicia).
+    # Arming lives in system/bin/s5-politica-boot, which is what the
+    # policy calls during poweroff: a SINGLE implementation, and this order only
+    # uses it to rehearse (--armar-solo = arm and do NOT reboot).
     if [ ! -x "$HERE/system/bin/s5-politica-boot" ]; then
-        echo "no encuentro $HERE/system/bin/s5-politica-boot" >&2
+        echo "cannot find $HERE/system/bin/s5-politica-boot" >&2
         return 1
     fi
     S5_POLITICA_LOG="$LOG" S5_DESCUBRE_BOOT="$HERE/system/bin/s5-descubre-boot" \
@@ -222,22 +222,22 @@ abortar() {
     exigir_root
     v=$(ls -1 "$BOOT_EFIVARS"/LoaderEntryOneShot-* 2>/dev/null | head -1)
     if [ -z "${v:-}" ]; then
-        echo "no habia nada armado"
+        echo "there was nothing armed"
         return 0
     fi
-    # `bootctl set-oneshot ''` no vale para borrar en todas las versiones, y `rm`
-    # a secas TAMPOCO: las variables EFI son inmutables (----i---- en lsattr) y el
-    # kernel devuelve EPERM. Hay que quitarles el atributo primero, que es lo que
-    # hace bootctl por dentro.
+    # `bootctl set-oneshot ''` does not work to delete on all versions, and a plain `rm`
+    # does NOT either: EFI variables are immutable (----i---- in lsattr) and the
+    # kernel returns EPERM. The attribute must be removed first, which is what
+    # bootctl does internally.
     chattr -i "$v" 2>/dev/null || true
     rm -f "$v" 2>/dev/null || true
     if [ -e "$v" ]; then
-        echo "no pude borrar $v (¿sin permisos? prueba: sudo chattr -i $v && sudo rm -f $v)" >&2
+        echo "could not delete $v (no permissions? try: sudo chattr -i $v && sudo rm -f $v)" >&2
         return 1
     fi
     sync
-    say "DESARMADO: variable LoaderEntryOneShot borrada"
-    echo "desarmado"
+    say "DISARMED: LoaderEntryOneShot variable deleted"
+    echo "disarmed"
 }
 
 case "${1:-estado}" in
