@@ -105,6 +105,22 @@
 # all, `s5-test -a` fails loudly rather than patching the wrong directory.
 #S5_BLS_DIR=/boot/loader/entries
 
+# Which entry powers the machine off when the rare case is diverted through the
+# bootloader. `app` (the default) uses the EFI halt application installed here, so
+# the entry and the application live on the ESP; `builtin` uses systemd-boot's own
+# "Power Off The System" entry, which needs `auto-poweroff yes` in loader.conf
+# (loader v255+) and nothing installed at all.
+#
+# Why you might prefer `builtin`: arming is then a single EFI variable write, and
+# `bootctl set-oneshot` does not touch the ESP — which matters because the ESP is
+# already unmounted by the time the shutdown policy runs (measured 2026-08-11:
+# boot.mount dies 100 ms before shutdown.target). With `app`, arming works without
+# the ESP too (measured 2026-10-07: `bootctl --esp-path=<nonexistent> set-oneshot`
+# reaches the write and fails only on permissions), but the entry and the
+# application cannot be re-checked at that moment, so that check stays at install
+# time.
+#S5_BOOT_RUTA=app
+
 # Optional fallback `.ko` for insmod, in case the akmod's modprobe fails.
 # EMPTY BY DEFAULT, and that is deliberate: the akmod is the only mechanism that
 # survives a kernel update, and a hand-built .ko stops working the moment the

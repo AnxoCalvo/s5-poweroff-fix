@@ -85,7 +85,12 @@ fi
 paso "Via de systemd-boot para el caso raro"
 salida_boot="$(bash system/bin/s5-descubre-boot 2>&1)"; rc_boot=$?
 printf '%s\n' "$salida_boot" | sed 's/^/   /'
-if [ "$rc_boot" = 0 ] && [ ! -e /boot/EFI/s5-halt/s5-halt.efi ]; then
+if [ "${S5_BOOT_RUTA:-app}" = builtin ]; then
+    echo "   RUTA builtin: apaga la entrada integrada del cargador ('Power Off The System')."
+    echo "         No hay aplicacion EFI que compilar, firmar ni instalar, y armar solo"
+    echo "         escribe una variable EFI: la ESP no se toca en la ventana de apagado."
+    echo "         Requiere 'auto-poweroff yes' en loader.conf (systemd 255+)."
+elif [ "$rc_boot" = 0 ] && [ ! -e /boot/EFI/s5-halt/s5-halt.efi ]; then
     echo "   NOTA: falta la aplicacion EFI; el caso raro seguira sin salvavidas hasta"
     echo "         'sudo s5-boot-halt instalar' (necesita gnu-efi y, con Secure Boot, firmarla)."
 fi

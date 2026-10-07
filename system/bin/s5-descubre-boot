@@ -8,10 +8,19 @@
 #     BOOT_BOOTCTL    el binario bootctl, o vacio
 #     BOOT_ONESHOT    "si" si este systemd-boot entiende entradas de un solo uso
 #     BOOT_EFIVARS    /sys/firmware/efi/efivars (hace falta para armar)
-#     BOOT_HALT_ID    identificador de la entrada (s5-halt)
+#     BOOT_RUTA       app | builtin: con que entrada se apaga
+#     BOOT_ARMAR_ID   el id que va a la variable de un solo uso
+#     BOOT_HALT_ID    identificador de la entrada de la aplicacion (s5-halt)
 #     BOOT_HALT_EFI   ruta de la aplicacion EFI de apagado EN LA ESP
 #     BOOT_HALT_ENTRY fichero de la entrada en $BOOT_ESP/loader/entries
 #     BOOT_LIMITE     por que NO se puede usar, si no se puede (texto o vacio)
+#     BOOT_AVISO      lo que no se ha podido comprobar y NO impide la via
+#
+# DOS PREGUNTAS DISTINTAS, y confundirlas costo un limite falso. INSTALAR pide la
+# ESP montada; ARMAR no: `bootctl set-oneshot` escribe una variable EFI y no toca
+# la ESP. Con S5_BOOT_ARMAR=1 la pregunta es la segunda, y lo que solo hace falta
+# para instalar pasa a BOOT_AVISO en vez de BOOT_LIMITE. Es lo que permite armar
+# en la ventana real, con /boot ya desmontado.
 #
 # y vacio lo que no encuentre, para que quien llama decida (todos los que lo usan
 # fallan seguro: se registra y el apagado sigue su curso normal).
@@ -49,6 +58,39 @@ BOOT_ONESHOT=''
 BOOT_LIMITE=''
 BOOT_SB=''
 
+# --- la ruta, y en que MODO se pregunta ------------------------------------
+# RUTA. `app` (por defecto) apaga con s5-halt.efi, asi que la entrada y la
+# aplicacion viven en la ESP. `builtin` usa la entrada integrada de systemd-boot
+# ("Power Off The System", que existe con `auto-poweroff yes` en loader.conf): la
+# entrada la pone el cargador y no hay nada que instalar en la ESP.
+BOOT_RUTA=${S5_BOOT_RUTA:-app}
+if [ "$BOOT_RUTA" = builtin ]; then
+    BOOT_ARMAR_ID=auto-poweroff
+else
+    BOOT_ARMAR_ID=$BOOT_HALT_ID
+fi
+
+# MODO. Y el modo importa tanto como la ruta, porque INSTALAR y ARMAR no piden lo
+# mismo. Instalar necesita la ESP montada; armar NO: `bootctl set-oneshot` escribe
+# una variable EFI y no toca la ESP. Comprobado el 2026-10-07 con
+# `bootctl --esp-path=<dir inexistente> set-oneshot ...`: llega a la escritura de la
+# variable y solo falla por permisos. Eso importa porque la ventana real es
+# justo cuando la ESP ya no esta: medido el 2026-08-11, boot.mount se desmonta
+# 100 ms ANTES de que se alcance `shutdown.target`. Con S5_BOOT_ARMAR=1, lo que
+# solo hace falta para instalar pasa a ser aviso (BOOT_AVISO) y no limite; lo que
+# hace falta para armar (bootctl y efivarfs) sigue siendo limite.
+BOOT_ARMAR=${S5_BOOT_ARMAR:-0}
+BOOT_AVISO=''
+
+# Aviso y limite no son lo mismo: un aviso se dice y se sigue; un limite para la
+# via. La distincion existe para no declarar muerta una via que funciona.
+avisar() { BOOT_AVISO="${BOOT_AVISO:+$BOOT_AVISO; }$1"; }
+limitar() { BOOT_LIMITE="${BOOT_LIMITE:+$BOOT_LIMITE; }$1"; }
+
+# ¿Esta la ESP disponible AHORA MISMO? No es lo mismo que "existe una ESP": en la
+# ventana de apagado la ruta sigue puesta pero el montaje ya no.
+esp_ahora() { [ -n "$BOOT_ESP" ] && [ -d "$BOOT_ESP/loader/entries" ] && [ -d "$BOOT_ESP/EFI" ]; }
+
 # --- la ESP ---------------------------------------------------------------
 # Primero se le pregunta a bootctl, que ya sabe leer /etc/fstab y el montaje
 # real; y solo si no esta se prueba la lista de siempre. El orden importa: una
@@ -65,9 +107,15 @@ if [ -z "$BOOT_ESP" ]; then
 fi
 # La ESP tiene que tener las DOS cosas: `loader/entries`, que es donde va la
 # entrada, y `EFI`, que es donde va la aplicacion. Un /boot que solo tiene
-# vmlinuz (el caso de una maquina con GRUB y /boot aparte) no sirve.
-if [ -n "$BOOT_ESP" ] && { [ ! -d "$BOOT_ESP/loader/entries" ] || [ ! -d "$BOOT_ESP/EFI" ]; }; then
-    BOOT_LIMITE="${BOOT_LIMITE:+$BOOT_LIMITE; }$BOOT_ESP no parece una ESP de systemd-boot (falta loader/entries o EFI)"
+# vmlinuz (el caso de una maquina con GRUB y /boot aparte) no sirve. Pero eso es
+# una condicion de INSTALACION: si lo que se va a hacer es armar y la ESP no esta
+# montada, no es un limite — es la ventana real, y armar no la necesita.
+if ! esp_ahora; then
+    if [ "$BOOT_ARMAR" = 1 ]; then
+        avisar "${BOOT_ESP:-(sin ESP)} no esta disponible ahora (el armado no la necesita: 'bootctl set-oneshot' escribe una variable EFI)"
+    else
+        limitar "${BOOT_ESP:-(sin ESP)} no parece una ESP de systemd-boot (falta loader/entries o EFI)"
+    fi
 fi
 
 # --- bootctl y la entrada de un solo uso ---------------------------------
@@ -85,8 +133,13 @@ fi
 if [ -n "$BOOT_BOOTCTL" ]; then
     if "$BOOT_BOOTCTL" status 2>/dev/null | grep -q 'One-shot entry control'; then
         BOOT_ONESHOT=si
+    elif [ "$BOOT_ARMAR" = 1 ] && ! esp_ahora; then
+        # Sin la ESP no se puede preguntar. Se arma igual: armar es escribir una
+        # variable EFI, y la capacidad del cargador se comprobo al instalar. Se
+        # dice que es lo que no se ha podido comprobar ahora.
+        avisar "no puedo comprobar 'One-shot entry control' sin la ESP (se comprobo al instalar)"
     else
-        BOOT_LIMITE="${BOOT_LIMITE:+$BOOT_LIMITE; }este systemd-boot no anuncia 'One-shot entry control'"
+        limitar "este systemd-boot no anuncia 'One-shot entry control'"
     fi
 fi
 
@@ -129,12 +182,26 @@ else
     BOOT_HALT_EFI=''
 fi
 
+# La entrada integrada la provee el cargador, pero solo si loader.conf la
+# habilita. Con la ESP delante eso SI es un limite: sin `auto-poweroff yes` la
+# entrada no existe y armar ese id no apaga nada. Sin la ESP no se puede leer; se
+# dice, y manda lo que se comprobo al instalar.
+if [ "$BOOT_RUTA" = builtin ]; then
+    if esp_ahora; then
+        grep -qE '^[[:space:]]*auto-poweroff[[:space:]]+yes' "$BOOT_ESP/loader/loader.conf" 2>/dev/null \
+            || limitar "$BOOT_ESP/loader/loader.conf no habilita 'auto-poweroff yes': no habria entrada que armar"
+    else
+        avisar "no puedo leer loader.conf sin la ESP (el 'auto-poweroff yes' se comprobo al instalar)"
+    fi
+fi
+
 if [ -n "$BOOT_LIMITE" ]; then
     BOOT_ONESHOT=''
 fi
 
 # Ejecutado en vez de sourceado: informe para comprobar antes de instalar.
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    printf 'ruta               : %s (id a armar: %s)\n' "$BOOT_RUTA" "$BOOT_ARMAR_ID"
     printf 'ESP                : %s\n' "${BOOT_ESP:-(no encontrada)}"
     printf 'bootctl            : %s\n' "${BOOT_BOOTCTL:-(no encontrado)}"
     printf 'entrada de 1 uso   : %s\n' "${BOOT_ONESHOT:-NO}"
@@ -144,6 +211,10 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
         "$([ -n "$BOOT_HALT_ENTRY" ] && [ -e "$BOOT_HALT_ENTRY" ] && echo '  (ya escrita)' || echo '  (falta)')"
     printf 'aplicacion EFI     : %s%s\n' "${BOOT_HALT_EFI:-(sin ESP)}" \
         "$([ -n "$BOOT_HALT_EFI" ] && [ -e "$BOOT_HALT_EFI" ] && echo '  (ya instalada)' || echo '  (falta)')"
+    if [ -n "$BOOT_AVISO" ]; then
+        echo
+        echo "AVISO (no impide la via): $BOOT_AVISO"
+    fi
     if [ -n "$BOOT_LIMITE" ]; then
         echo
         echo "NO SE PUEDE USAR: $BOOT_LIMITE"
