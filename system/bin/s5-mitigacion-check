@@ -590,13 +590,63 @@ fi
 # y por eso pasar el umbral con ella es concluyente sin suponer nada sobre
 # cuanto gasta la maniobra (regla 31: si una salvedad depende de una magnitud, se
 # calcula la magnitud, no se redacta — no se mete una constante en un veredicto).
-med="$(grep -E '^ *=> APAGADO ' "$ELOG" 2>/dev/null | tail -1)"
+#
+# LOS REINICIOS NO SON UN S5, y el medidor no los distingue: s5-energy-log apunta
+# su linea APAGADO en CUALQUIER parada del servicio, y el resumen `=>` del
+# arranque siguiente sale igual. El 2026-10-29 un reinicio de 47 s se publico
+# como "40.14 W: eso no es un S5, es un CUELGUE" — la ventana era toda E0 de un
+# equipo que nunca llego a apagarse. Quien sabe que parada fue es el hook 99, que
+# abre cada bloque con `accion=<poweroff|reboot|...>  kernel=`, unos segundos
+# DESPUES de la linea APAGADO (corre al final de systemd-shutdown).
+#
+# PERO NO TODO `accion=reboot` ES UN REINICIO DE VERDAD: la rama de GRUB de la
+# politica apaga REINICIANDO (`systemctl --force reboot` y GRUB hace el halt), y
+# su cabecera dice `accion=reboot`. Esa ventana es justo la que §10 sabe puntuar
+# (la noche del 2026-08-14, 0,32 W), y saltarla tiraria la mejor medida de la
+# serie. La politica cuelga de poweroff.target y NUNCA corre en un reinicio, asi
+# que un bloque `POLITICA GPU` entre la linea APAGADO y la cabecera basta para
+# saber que aquello era un apagado. Lo mismo hacen las pruebas de laboratorio
+# que apagan desde fuera de Linux (s5-grub-halt): reinician A PROPOSITO hacia un
+# S5 que si se mide, y lo anuncian en $ELOG con `### PRUEBA '...' — reiniciando`
+# antes de su linea APAGADO. El historial de esta maquina tiene 34; sin esta
+# excepcion, la de 7,70 h del 2026-08-10 salia como "reinicio".
+#
+# ANTE LA DUDA, NO SE SALTA: sin cabecera (log rotado, hook ausente, fixtures),
+# demasiado lejos (>600 s, la misma holgura que la correlacion de la politica) o
+# con politica de por medio, la ventana se queda — y entonces se comporta igual
+# que antes. Lo peor que puede pasar es el aviso de siempre, nunca un aprobado.
+es_reinicio() {  # es_reinicio <fecha de la linea APAGADO> -> 0 si fue un reinicio corriente
+    local me cab hts acc pol he
+    me="$(ep "$1")"; [ -n "$me" ] || return 1
+    cab="$(awk -v t="$1" '
+        ($2 " " $3) < t { next }
+        /^===== [0-9-]+ [0-9:]+  POLITICA GPU/ { pol = "p" }
+        /^===== [0-9-]+ [0-9:]+  accion=[a-z]+  kernel=/ { print $2 " " $3 "|" $4 "|" pol; exit }
+    ' "$PCILOG" 2>/dev/null)"
+    [ -n "$cab" ] || return 1
+    IFS='|' read -r hts acc pol <<< "$cab"
+    case "$acc" in accion=reboot|accion=kexec) ;; *) return 1 ;; esac
+    [ -z "$pol" ] || return 1
+    he="$(ep "$hts")"; [ -n "$he" ] && [ "$he" -ge "$me" ] && [ $((he - me)) -le 600 ]
+}
 # El resumen `=>` no lleva fecha; la del apagado al que pertenece esta en la
 # linea `APAGADO` de encima. Hace falta para correlacionarlo con la politica:
 # sin eso, un desvio por GRUB de hace tres apagados taparia una medida buena.
-medts="$(awk '$1 ~ /^20[0-9][0-9]-/ && $3 == "APAGADO" { ts = $1 " " $2 }
-              /^ *=> APAGADO / { ult = ts }
-              END { print ult }' "$ELOG" 2>/dev/null)"
+# Se recorren del mas nuevo al mas viejo y se queda el primero que no sea un
+# reinicio; los ultimos 50 bastan (cada reinicio cuesta una pasada por $PCILOG).
+# La marca de prueba vale para TODA la ventana (de un ARRANQUE al siguiente):
+# un arranque minimo puede escribir una segunda linea APAGADO despues de ella.
+med=''; medts=''; reinicios=0; ult_reinicio=''
+while IFS='|' read -r ts prueba linea; do
+    if [ -n "$ts" ] && [ -z "$prueba" ] && es_reinicio "$ts"; then
+        reinicios=$((reinicios+1)); [ -n "$ult_reinicio" ] || ult_reinicio="$ts"
+        continue
+    fi
+    med="$linea"; medts="$ts"; break
+done < <(awk '$1 ~ /^20[0-9][0-9]-/ && $3 == "ARRANQUE" { p = ""; next }
+              /^### PRUEBA .* — reiniciando/ { p = "p" }
+              $1 ~ /^20[0-9][0-9]-/ && $3 == "APAGADO" { ts = $1 " " $2; wp = p }
+              /^ *=> APAGADO / { print ts "|" wp "|" $0 }' "$ELOG" 2>/dev/null | tail -50 | tac)
 grubwin=0
 if [ -n "$POL_GRUB_TS" ] && [ -n "$medts" ]; then
     pe="$(ep "$POL_GRUB_TS")"; me="$(ep "$medts")"
@@ -634,7 +684,12 @@ if [ "$grubwin" = 1 ] && [ -n "$S5_REAL_S" ]; then
 fi
 
 w="$(printf '%s' "$med" | sed -E 's/.*=  *([0-9.]+) W medios.*/\1/')"
-if [ -z "$med" ]; then
+if [ "$reinicios" -gt 0 ] && [ -n "$med" ]; then
+    di "  [ -- ]   despues hubo $reinicios reinicio(s) (el ultimo, $ult_reinicio): un reinicio no pasa por S5, asi que se mide el apagado anterior ($medts)"
+fi
+if [ -z "$med" ] && [ "$reinicios" -gt 0 ]; then
+    di "  [ -- ]   en los ultimos resumenes de $ELOG solo hay reinicios ($reinicios): ningun S5 que medir todavia"
+elif [ -z "$med" ]; then
     aviso "no hay ningun resumen '=> APAGADO' en $ELOG"
 elif printf '%s' "$med" | grep -q 'no es medible'; then
     di "  [ -- ]   el ultimo apagado fue ENCHUFADO: el vataje no es medible asi (la bateria estaba cargando)"

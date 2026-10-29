@@ -266,7 +266,7 @@ caso() {  # caso <titulo> <esperado(regex)> <VAR=val>...
     n=$((n+1))
     local out linea
     out="$(env "$@" bash "$CHK" 2>&1)"
-    linea="$(printf '%s\n' "$out" | grep -E 'politica: GRUB|politica: NO se ve|se DESVIO POR GRUB|se desvio por GRUB|ultimo apagado|ACPI FPDT|sin journal del arranque|desvio por GRUB no fue|de la ventana, solo el|no se ha podido medir cuanto|NO CUADRAN' | head -3)"
+    linea="$(printf '%s\n' "$out" | grep -E 'politica: GRUB|politica: NO se ve|se DESVIO POR GRUB|se desvio por GRUB|ultimo apagado|ACPI FPDT|sin journal del arranque|desvio por GRUB no fue|de la ventana, solo el|no se ha podido medir cuanto|NO CUADRAN|se mide el apagado anterior|solo hay reinicios|CUELGUE' | head -3)"
     if printf '%s' "$linea" | grep -qE "$esperado"; then
         printf '  [ok]    %s\n' "$titulo"
     else
@@ -331,6 +331,42 @@ caso "noche entera desviada pero CARA => FALLA (la rama nueva no es un indulto)"
                                         'gasto 19.40 W' "${DESVIO[@]}" "${ANCLA[@]}" ELOG="$F/e-noche-cara.log" FPDT="$F/fpdt-ok" ARRANQUE="$ARR_NOCHE"
 caso "noche larga pero sin saber cuanto fue S5 (sin FPDT) => se abstiene sin inventarse la cifra" \
                                         'no se ha podido medir cuanto' "${DESVIO[@]}" "${ANCLA[@]}" ELOG="$F/e-noche.log" FPDT="$F/no-existe" ARRANQUE="$ARR_NOCHE"
+
+# LOS REINICIOS. s5-energy-log apunta APAGADO tambien al reiniciar, y el
+# 2026-10-29 un reinicio de 47 s salio como "40.14 W ... CUELGUE". Quien sabe que
+# parada fue es la cabecera del hook 99 (`accion=reboot  kernel=`), unos segundos
+# despues. Las dos excepciones —la politica y las pruebas de laboratorio apagan
+# REINICIANDO hacia GRUB— tienen caso propio, porque sin ellas se tiraria
+# justo la mejor medida de la serie.
+REIN_TS="$(f $((FIN + 20000)))"                 # un reinicio, despues de todo lo demas
+cab99() { printf '\n===== %s  accion=%s  kernel=7.2.13-200.fc44.x86_64\n' "$1" "$2"; }
+{ cab99 "$APAG_TS" poweroff; pmrt_ok "$APAG_TS"; cab99 "$(f $((FIN + 20004)))" reboot; } > "$F/pol-reinicio.log"
+{ cab99 "$APAG_TS" poweroff; pmrt_ok "$APAG_TS"; cab99 "$(f $((FIN + 20700)))" reboot; } > "$F/pol-reinicio-lejos.log"
+# la noche del 2026-08-14 tal cual: la cabecera del desvio dice `reboot`
+{ pmrt_ok "$APAG_TS"; pol_grub "$POL_TS"; cab99 "$(f $((FIN - 2)))" reboot; } > "$F/pol-grub-cab.log"
+{ pmrt_ok "$APAG_TS"; cab99 "$(f $((FIN - 89)))" reboot; } > "$F/pol-lab.log"
+mk_elog_rein() {  # mk_elog_rein <fichero> <vatios del apagado de verdad>
+    mk_elog "$1" "$APAG_TS" "$2" 9.20
+    { echo "$REIN_TS  APAGADO     39.116 Wh   59%  Discharging  (bateria)"
+      echo "$(f $((FIN + 20047)))  ARRANQUE    38.592 Wh   58%  Discharging  (bateria)"
+      echo "          => APAGADO 0.01 h a bateria: -0.524 Wh  =  40.14 W medios en S5"
+    } >> "$1"
+}
+mk_elog_rein "$F/e-rein-bajo.log" 0.46
+mk_elog_rein "$F/e-rein-alto.log" 19.40
+{ echo "### PRUEBA 'grub-halt' — reiniciando $APAG_TS  bat 54% 37.191 Wh"
+  cat "$F/e-bajo.log"; } | sed 's/0\.04 h a bateria: -[0-9.]* Wh  =  0\.46 W/0.40 h a bateria: -0.708 Wh  =  1.77 W/' > "$F/e-lab.log"
+R=(FPDT="$F/fpdt-ok" ARRANQUE="$ARR_APAGO" S5_DESCUBRE="$F/no-existe")
+caso "REINICIO despues del apagado => se mide el apagado (el falso CUELGUE del 2026-10-29)" \
+                                        'ultimo apagado medido: 0.46 W' "${R[@]}" PCILOG="$F/pol-reinicio.log" ELOG="$F/e-rein-bajo.log"
+caso "...y dice que se ha saltado un reinicio, no lo esconde"                 'se mide el apagado anterior' "${R[@]}" PCILOG="$F/pol-reinicio.log" ELOG="$F/e-rein-bajo.log"
+caso "un reinicio NO tapa un apagado caro => FALLA igual"                      'gasto 19.40 W' "${R[@]}" PCILOG="$F/pol-reinicio.log" ELOG="$F/e-rein-alto.log"
+caso "sin cabecera del hook no se sabe que fue => no se salta (ante la duda, lo de antes)" \
+                                        'CUELGUE' "${R[@]}" PCILOG="$F/pol-normal.log" ELOG="$F/e-rein-bajo.log"
+caso "cabecera a mas de 600 s => es de otra parada, no se salta"              'CUELGUE' "${R[@]}" PCILOG="$F/pol-reinicio-lejos.log" ELOG="$F/e-rein-bajo.log"
+caso "el desvio por GRUB REINICIA, pero no es un reinicio => la noche se puntua" \
+                                        'ultimo apagado medido: 0.32 W' "${DESVIO[@]}" "${ANCLA[@]}" PCILOG="$F/pol-grub-cab.log" ELOG="$F/e-noche.log" FPDT="$F/fpdt-ok" ARRANQUE="$ARR_NOCHE"
+caso "una PRUEBA que reinicia hacia GRUB (s5-grub-halt) tampoco => se mide"   'ultimo apagado medido: 1.77 W' "${R[@]}" PCILOG="$F/pol-lab.log" ELOG="$F/e-lab.log"
 
 echo
 echo "regla 17 — que hay en el directorio de hooks"

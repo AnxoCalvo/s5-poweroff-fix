@@ -250,7 +250,7 @@ system/     what gets installed: shutdown hooks, scripts, units, logrotate
   bin/s5-descubre-dgpu   finds the dGPU via sysfs (no hardcoded paths)
 kmod/       module source (plain .c) + the akmod spec that packages it
 tools/      measurement and diagnostic instruments (install.sh --tools)
-tests/      94-branch test: verifier, uninstaller, device and GRUB-flavour
+tests/      101-branch test: verifier, uninstaller, device and GRUB-flavour
             detection and the rare-case policy — all with generated fixtures
 docs/       the evidence base
 ```
