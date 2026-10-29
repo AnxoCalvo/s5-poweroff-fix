@@ -88,6 +88,13 @@ battery `energy_now` reading before and after.
 | 09-14 | **`tras-actualizar-kernel-v6`** | a whole night, first shutdown on **7.2.5-200** | **2.017 Wh** / 9.33 h ⇒ **0.22 W** | **CLEAN** (low regime, see below) |
 | 09-23 | `tras-actualizar-kernel-v7` | a whole night, first shutdown on **7.2.6-200** | 0.000 Wh / 7.69 h — gauge pinned at 100 % at both ends | **NOT SCORABLE** (shield ran: `disable=3 shutdown_anulados=2`) |
 | 09-24 | **`tras-actualizar-kernel-v8`** | a whole night on **7.2.7-200** (the first shutdown on it, 09-23, lasted 3.5 min and is all E₀) | **3.512 Wh** / 8.55 h ⇒ **0.41 W** | **CLEAN** |
+| 10-05 | **`tras-actualizar-kernel-v9`** | a whole night on **7.2.8-200** (the first shutdown on it, 10-02, lasted under 2 min and is all E₀) | **4.358 Wh** / 9.61 h ⇒ **0.45 W** | **CLEAN** |
+| 10-10 | **`tras-actualizar-kernel-v10`** | a whole night, first shutdown on **7.2.9-200** | **4.035 Wh** / 8.68 h ⇒ **0.46 W** | **CLEAN** |
+| 10-13 | **`tras-actualizar-kernel-v11`** | a whole night, first shutdown on **7.2.9-201** (a Fedora rebuild: new `uname -r`, so the akmod had to rebuild too) | **4.328 Wh** / 9.21 h ⇒ **0.47 W** | **CLEAN** |
+| 10-15 | **`tras-actualizar-kernel-v12`** | a whole night, first shutdown on **7.2.10-200** — and the first on the new NVIDIA driver `615.78.08` (was `615.71.09`) | **3.757 Wh** / 7.65 h ⇒ **0.49 W** | **CLEAN** |
+| 10-19 | **`tras-actualizar-kernel-v13`** | a whole night on **7.2.11-200**; the first shutdown on it (10-18) was plugged in and cannot be scored | **4.219 Wh** / 9.32 h ⇒ **0.45 W** | **CLEAN** |
+| 10-28 | `tras-actualizar-kernel-v14` | a whole night, the only shutdown on **7.2.12-200**; plugged in when it powered off, on battery by morning | 3.404 Wh / 8.58 h — not a rate: the time on battery is unknown | **NOT SCORABLE** (shield ran: `disable=3 shutdown_anulados=2`) |
+| 10-29 | `tras-actualizar-kernel-v15` | a whole night, first shutdown on **7.2.13-200**; plugged in when it powered off, on battery by morning | 3.773 Wh / 10.59 h — not a rate, same reason | **NOT SCORABLE** (shield ran: `disable=3 shutdown_anulados=2`) |
 
 **The eight `nocturna-real` rows are the ones that count** — not because the wattage is lower
 than the 20-minute windows (it is the same figure, with E₀ amortised over a window 20×
@@ -135,13 +142,33 @@ cause is not known. The gauge is a suspect: in the middle of it, the 09-15 night
 **+0.662 Wh gained** over 10.89 h on battery while the percentage fell 74 → 71 %, which is not
 physical. Either way, all of it sits well under the 1 W success line.
 
+**Seven more crossings in October, and a new NVIDIA driver.** Between 2026-10-02 and
+2026-10-28 the machine went through `7.2.8-200`, `7.2.9-200`, `7.2.9-201`, `7.2.10-200`,
+`7.2.11-200`, `7.2.12-200` and `7.2.13-200`. Same witnesses as before: each time akmods
+built `kmod-s5-pmrt-arm` for the new `uname -r` within about three minutes of the kernel
+transaction (`dnf history`), and all 23 poweroffs on these seven kernels loaded it
+(`PMRT insmod rc=0 via=akmod`) and shielded all three devices
+(`disable=3 shutdown_anulados=2`), per `/var/log/s5-shutdown-pci.log`. On 10-14 the NVIDIA
+driver also moved from `615.71.09` to `615.78.08`; its `.shutdown` is one of the two the
+shield cancels, and it kept being cancelled. `s5-mitigacion-check` on `7.2.13-200`
+(2026-10-29) found the akmod module with no build failures and came back all in order.
+Five of the seven have a whole scorable night on battery; the last two do not, because the
+laptop powered off on the charger and was unplugged at some unknown point in the night, so
+the drop is not a rate. Across the whole month, the 14 scorable nights came out at
+0.44-0.52 W — a touch above late September's 0.41-0.47 W, with the two 0.52 W nights on
+`7.2.9-201` and `7.2.11`, each of which also measured 0.47 W and 0.44-0.46 W on other nights.
+Still well under the 1 W success line.
+
 **None of these kernels fixes the bug itself.** That was checked in the source, not in the
 wattage — the wattage cannot tell, because the shield ran on every one of these shutdowns.
 `pci_device_shutdown()` in `drivers/pci/pci-driver.c` is identical in the stable tags
 `v7.1.10`, `v7.1.13` and `v7.2.7` and in mainline (`7.3-rc4`, fetched 2026-09-24): it still
 calls `pm_runtime_resume(dev)` unconditionally before `drv->shutdown()`. Its caller,
 `device_shutdown()` in `drivers/base/core.c`, is identical between `v7.1.10` and `v7.2.7`, and
-`kernel_power_off()` still goes through it. The shield is still needed.
+`kernel_power_off()` still goes through it. Re-checked on 2026-10-29: both functions are
+still identical in `v7.2.13` and in mainline (past `7.3-rc7`), and Fedora's own patch on top
+of `7.2.13-200` (`patch-7.2-redhat.patch`, `f44` branch) touches neither file. The shield is
+still needed.
 
 ## The rare case, rehearsed end to end (`politica-grub-real-v1`)
 

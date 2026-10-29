@@ -218,6 +218,11 @@ Honestly:
   0.42 W over the same 2.5 h window — see
   [`docs/EVIDENCE-second-unit.md`](docs/EVIDENCE-second-unit.md). The mechanism is
   generic; the numbers are not.
+- A **third owner** of the same laptop — same Ryzen 9 8940HX and RTX 5060 as the reference
+  machine, on Nobara — [reported](https://github.com/AnxoCalvo/s5-poweroff-fix/issues/1)
+  that this repo was the only fix that worked for them. It is the first report of *this*
+  code, not a reimplementation, working on someone else's machine and on another
+  distribution. It is a user report, not a measurement: no numbers came with it.
 - The overnight measurement is at **n=8** (0.46 / 0.46 / 0.47 / 0.45 / 0.41 / 0.42 / 0.43 /
   0.45 W), but all eight are the same laptop: they repeat the measurement, they do not
   make it independent.
@@ -225,14 +230,15 @@ Honestly:
   2026-08-14: 0.32 W over 9.55 h), but at **n=1**, and only ever with the dGPU pinned to
   D0 by hand to force it. Nobody has yet seen it fire because a real workload held the
   GPU awake.
-- It **has** survived nine kernel upgrades (2026-08-13, 2026-08-24, 2026-08-26, and six more
-  from 2026-09-02 to 2026-09-23, up to `7.2.7-200` — including the jump from 7.1 to 7.2).
-  That was the most likely silent failure. It is still the thing to watch after every
-  kernel update, which is what `s5-mitigacion-check` is for.
+- It **has** survived sixteen kernel upgrades (2026-08-13, 2026-08-24, 2026-08-26, six more
+  from 2026-09-02 to 2026-09-23 — including the jump from 7.1 to 7.2 — and seven more from
+  2026-10-02 to 2026-10-28, up to `7.2.13-200`). That was the most likely silent failure.
+  It is still the thing to watch after every kernel update, which is what
+  `s5-mitigacion-check` is for.
 - This is a **userspace mitigation of a kernel problem**, not the fix. The real fix
   belongs upstream: `pci_device_shutdown()` should not resurrect devices that are already
-  in D3cold and whose driver does not need `shutdown()`. As of `7.2.7` and mainline
-  `7.3-rc4` (checked 2026-09-24) it is unchanged and still resumes every device.
+  in D3cold and whose driver does not need `shutdown()`. As of `7.2.13` and mainline
+  past `7.3-rc7` (checked 2026-10-29) it is unchanged and still resumes every device.
 
 No distribution carries a fix for this, and there is no DMI quirk for S5 power in the
 kernel — hence this repo.
