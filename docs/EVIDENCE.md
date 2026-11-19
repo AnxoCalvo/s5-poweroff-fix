@@ -95,6 +95,9 @@ battery `energy_now` reading before and after.
 | 10-19 | **`tras-actualizar-kernel-v13`** | a whole night on **7.2.11-200**; the first shutdown on it (10-18) was plugged in and cannot be scored | **4.219 Wh** / 9.32 h ⇒ **0.45 W** | **CLEAN** |
 | 10-28 | `tras-actualizar-kernel-v14` | a whole night, the only shutdown on **7.2.12-200**; plugged in when it powered off, on battery by morning | 3.404 Wh / 8.58 h — not a rate: the time on battery is unknown | **NOT SCORABLE** (shield ran: `disable=3 shutdown_anulados=2`) |
 | 10-29 | `tras-actualizar-kernel-v15` | a whole night, first shutdown on **7.2.13-200**; plugged in when it powered off, on battery by morning | 3.773 Wh / 10.59 h — not a rate, same reason | **NOT SCORABLE** (shield ran: `disable=3 shutdown_anulados=2`) |
+| 11-03 | **`tras-actualizar-kernel-v16`** | a whole night, the only shutdown on **7.2.14-200** | **3.588 Wh** / 9.20 h ⇒ **0.39 W** | **CLEAN** |
+| 11-04 | **`tras-actualizar-kernel-v17`** | a whole night, the only shutdown on **7.2.15-200** | **4.728 Wh** / 11.32 h ⇒ **0.42 W** | **CLEAN** |
+| 11-06 | **`tras-actualizar-kernel-v18`** | a whole night on **7.2.15-300.fc45** — **the Fedora 44 → 45 upgrade**; the first shutdown on it (11-05) was plugged in and cannot be scored | **4.497 Wh** / 10.89 h ⇒ **0.41 W** | **CLEAN** |
 
 **The eight `nocturna-real` rows are the ones that count** — not because the wattage is lower
 than the 20-minute windows (it is the same figure, with E₀ amortised over a window 20×
@@ -159,6 +162,28 @@ the drop is not a rate. Across the whole month, the 14 scorable nights came out 
 `7.2.9-201` and `7.2.11`, each of which also measured 0.47 W and 0.44-0.46 W on other nights.
 Still well under the 1 W success line.
 
+**Three more crossings in November, one of them the Fedora 44 → 45 upgrade.** `7.2.14-200`
+(2026-11-02) and `7.2.15-200` (11-03) arrived as ordinary updates; `7.2.15-300.fc45` came with
+the upgrade to Fedora 45 itself (11-04, a 4,924-package transaction). Same witnesses
+as before: akmods built `kmod-s5-pmrt-arm` for each new `uname -r` — within two minutes of
+the kernel transaction for the first two, ten minutes after the distribution upgrade started
+for the third — and all eight poweroffs on these three kernels loaded it
+(`PMRT insmod rc=0 via=akmod`) and shielded all three devices
+(`disable=3 shutdown_anulados=2`). The NVIDIA driver stayed at `615.78.08` throughout.
+`s5-mitigacion-check` came back all in order on all 16 boots of the three kernels. Scorable
+nights: 0.39 W on `7.2.14`, 0.42 W on `7.2.15-200`, and on Fedora 45 0.41 / 0.40 / 0.48 /
+0.39 W. The 0.48 W one is a 5.54 h daytime window, where E₀ weighs almost twice as much as
+over a ten-hour night (rule 1).
+
+**Kernel 7.3: built, but never exercised.** `7.3.3-300` (11-10) and `7.3.4-300` (11-17) got
+their akmod module within two minutes too, and `s5-mitigacion-check` found it loadable on
+every boot (20 of them). But the shield has not run on a single poweroff on either kernel:
+from 2026-11-12 every poweroff was diverted through GRUB, because on 7.3 the NVIDIA driver
+leaves runtime D3 off and the dGPU never falls asleep (README, *Status and limits*;
+[NVIDIA/open-gpu-kernel-modules#1507](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/1507)).
+So 7.3 does not count as a crossing survived. The first normal shutdown after NVIDIA fixes
+its driver will be the module's first real run on 7.3.
+
 **None of these kernels fixes the bug itself.** That was checked in the source, not in the
 wattage — the wattage cannot tell, because the shield ran on every one of these shutdowns.
 `pci_device_shutdown()` in `drivers/pci/pci-driver.c` is identical in the stable tags
@@ -167,8 +192,10 @@ calls `pm_runtime_resume(dev)` unconditionally before `drv->shutdown()`. Its cal
 `device_shutdown()` in `drivers/base/core.c`, is identical between `v7.1.10` and `v7.2.7`, and
 `kernel_power_off()` still goes through it. Re-checked on 2026-10-29: both functions are
 still identical in `v7.2.13` and in mainline (past `7.3-rc7`), and Fedora's own patch on top
-of `7.2.13-200` (`patch-7.2-redhat.patch`, `f44` branch) touches neither file. The shield is
-still needed.
+of `7.2.13-200` (`patch-7.2-redhat.patch`, `f44` branch) touches neither file. Re-checked
+again on 2026-11-19: both functions are identical in `v7.2`, `v7.3` and mainline
+(`7.4-rc3`), and Fedora 45's patch on top of `7.3.5-300` (`patch-7.3-redhat.patch`, `f45`
+branch) touches neither file either. The shield is still needed.
 
 ## The rare case, rehearsed end to end (`politica-grub-real-v1`)
 

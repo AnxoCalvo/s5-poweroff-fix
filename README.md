@@ -220,7 +220,8 @@ walking down dead ends that have already been walked.
 
 Honestly:
 
-- Measured here on **one machine** (HP OMEN 16-ap0xxx, Fedora 44, RTX + integrated Radeon).
+- Measured here on **one machine** (HP OMEN 16-ap0xxx, RTX + integrated Radeon), on Fedora 44
+  and, since 2026-11-04, Fedora 45.
   A **second unit** of the same model (another CPU SKU, Arch + systemd-boot, its own
   implementation of the same two halves) reproduced both the drain and the fix: 20.33 W →
   0.42 W over the same 2.5 h window — see
@@ -253,15 +254,19 @@ Honestly:
   2026-11-19). This repo cannot fix it. What it does is send every shutdown through the
   GRUB branch, so the battery still does not drain overnight; each shutdown just takes
   about two minutes, with a visible POST.
-- It **has** survived sixteen kernel upgrades (2026-08-13, 2026-08-24, 2026-08-26, six more
-  from 2026-09-02 to 2026-09-23 — including the jump from 7.1 to 7.2 — and seven more from
-  2026-10-02 to 2026-10-28, up to `7.2.13-200`). That was the most likely silent failure.
-  It is still the thing to watch after every kernel update, which is what
-  `s5-mitigacion-check` is for.
+- It **has** survived nineteen kernel upgrades (2026-08-13, 2026-08-24, 2026-08-26, six more
+  from 2026-09-02 to 2026-09-23 — including the jump from 7.1 to 7.2 —, seven more from
+  2026-10-02 to 2026-10-28, and three more from 2026-11-02 to 2026-11-04, up to
+  `7.2.15-300` — including the upgrade from Fedora 44 to 45). That was the most likely
+  silent failure. It is still the thing to watch after every kernel update, which is what
+  `s5-mitigacion-check` is for. **Kernel 7.3 is not on that list yet:** akmods built the
+  module for `7.3.3` and `7.3.4`, but every shutdown on them has gone through the GRUB
+  branch (previous point), so the shield has not run on 7.3 even once.
 - This is a **userspace mitigation of a kernel problem**, not the fix. The real fix
   belongs upstream: `pci_device_shutdown()` should not resurrect devices that are already
-  in D3cold and whose driver does not need `shutdown()`. As of `7.2.13` and mainline
-  past `7.3-rc7` (checked 2026-10-29) it is unchanged and still resumes every device.
+  in D3cold and whose driver does not need `shutdown()`. As of `7.3` and mainline
+  `7.4-rc3` (checked 2026-11-19) it is unchanged and still resumes every device, and
+  Fedora 45's own kernel patch does not touch it.
 
 No distribution carries a fix for this, and there is no DMI quirk for S5 power in the
 kernel — hence this repo.
