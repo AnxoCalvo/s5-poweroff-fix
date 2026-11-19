@@ -48,6 +48,34 @@ _tareas=$(ps -u "$(id -u)" -L --no-headers 2>/dev/null | wc -l)
 [ "${_tareas:-0}" -gt 0 ] && ulimit -S -u $((_tareas + 500)) 2>/dev/null
 unset _tareas
 
+# LA CAUSA DE LA FUGA, ENCONTRADA EL 2026-11-19 (tres meses despues, y seis
+# intentos de reproducirla sin conseguirlo). No estaba en ningun script de este
+# proyecto: la ponia el bash del sistema.
+#
+#   1. bash, en un `-c` NO interactivo, carga ~/.bashrc (y con el, /etc/bashrc)
+#      si su stdin es un SOCKET y SHLVL < 2: cree que lo ha lanzado rshd/sshd
+#      (`isnetconn(stdin)` en shell.c). `env -i` borra SHLVL, asi que basta con
+#      que quien lanza el ensayo le pase un socket como stdin — un agente, un CI,
+#      un `ssh maquina ./tests/...`. Desde una terminal (stdin = tty) NO pasa.
+#   2. /etc/bashrc trae el `command_not_found_handle` de PackageKit.
+#   3. Con el PATH DE MENTIRA de grubcaso (solo $F/bin2), /etc/profile.d/
+#      debuginfod.sh no encuentra `tr`, salta el manejador, y el manejador hace
+#      `$(gettext ...)` — que tampoco esta en el PATH, asi que vuelve a saltar
+#      el manejador DENTRO de la subshell, y asi sin fondo. Cada nivel es un
+#      fork sin exec: misma linea de ordenes, cada proceso hijo del anterior.
+#
+# Reproducido con un scope de 30 tareas: `bash -x` lo ensena en tres lineas
+# ([[ ... ]] del manejador, gettext, otra vez el manejador un nivel mas abajo).
+# Capturado en vivo: dos cadenas de 137 y 84 procesos, huerfanas de un ensayo
+# que mato su `timeout`, y que de propina seguian sujetando el cerrojo de abajo
+# (las corridas siguientes salian al instante diciendo "ya hay otra corrida").
+#
+# El arreglo es quitarle el socket a todo lo que lance este ensayo. Nada de
+# aqui lee stdin; los heredocs llevan su propia redireccion y no les afecta. El
+# cinturon de RLIMIT_NPROC de arriba se queda: no depende de saber la causa, y
+# esta ha tardado tres meses en aparecer.
+exec </dev/null
+
 D="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 CHK="${CHK:-$D/../system/bin/s5-mitigacion-check}"
 [ -r "$CHK" ] || { echo "no encuentro el verificador en $CHK" >&2; exit 2; }
