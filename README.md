@@ -109,11 +109,19 @@ length — applies to this diagram as much as to the table. Elsewhere this proje
 20-minute window, where the fixed energy cost of shutting down and booting again —
 rule 1's `E₀` — has not yet been amortised. Same shutdown, shorter ruler.
 
-It has **never been needed on its own** across every real shutdown measured here: once
-userspace lets go, runtime PM puts the GPU to sleep well inside the 90 s budget. The only
-times the GRUB branch has fired were **deliberately forced** controls, pinning the dGPU to
-D0 to provoke it. It is insurance, not the mechanism — but it has now been measured over a
-whole night, and it works: see `politica-grub-real-v1` below.
+For three months it was **never needed on its own**: once userspace lets go, runtime PM
+puts the GPU to sleep well inside the 90 s budget, and the only times the GRUB branch fired
+were **deliberately forced** controls, pinning the dGPU to D0 to provoke it. It has been
+measured over a whole night, and it works: see `politica-grub-real-v1` below.
+
+**Kernel 7.3 changed that.** From 2026-11-12 the GRUB branch fired on **every** shutdown of
+the reference machine — eight in a row — because the NVIDIA driver stopped letting the dGPU
+sleep at all (see *Status and limits*). The battery did not drain on any of those nights:
+the safety net caught every one. But a shutdown that takes two minutes and shows a POST
+every night is the insurance paying out daily, which means the mechanism underneath has
+stopped working. `s5-mitigacion-check` now warns once that happens three times in a row,
+and says whether the dGPU never slept during the whole session (a driver problem) or was
+just busy at shutdown time (an external monitor, CUDA, PRIME offload).
 
 **Everything fails safe.** If the module will not load, if `/boot` cannot be mounted, if
 this GRUB has no `halt` command — it gets logged and the shutdown proceeds normally. You
@@ -229,7 +237,22 @@ Honestly:
 - The **GRUB branch** has now been measured over a whole night (`politica-grub-real-v1`,
   2026-08-14: 0.32 W over 9.55 h), but at **n=1**, and only ever with the dGPU pinned to
   D0 by hand to force it. Nobody has yet seen it fire because a real workload held the
-  GPU awake.
+  GPU awake. It has since fired on its own for a different reason (next point), but none
+  of those eight nights can be scored: two were on the charger, and the other six read
+  between −0.25 and +0.05 W, five of them as small *gains* — the battery gauge
+  recalibrating, not a measurement.
+- **Kernel 7.3 + the NVIDIA driver:** since kernel 7.3 the NVIDIA driver silently leaves
+  runtime D3 off, and the dGPU **never sleeps** — not at shutdown, and not while you are
+  using the laptop either. Check `/proc/driver/nvidia/gpus/<BDF>/power`: it reads
+  `Runtime D3 status: Disabled by default` (or `Not supported`) instead of
+  `Enabled (fine-grained)`. The cause is kernel commit `32750c77e811` (*"fs: start all
+  kthreads in nullfs"*): the driver initialises the GPU from a kernel thread, and from
+  there it can no longer open the sysfs file it needs. Reported upstream as
+  [NVIDIA/open-gpu-kernel-modules#1507](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/1507).
+  Seen here with 615.78.08 and 620.70.06, and the 620.73.04 source still has it (checked
+  2026-11-19). This repo cannot fix it. What it does is send every shutdown through the
+  GRUB branch, so the battery still does not drain overnight; each shutdown just takes
+  about two minutes, with a visible POST.
 - It **has** survived sixteen kernel upgrades (2026-08-13, 2026-08-24, 2026-08-26, six more
   from 2026-09-02 to 2026-09-23 — including the jump from 7.1 to 7.2 — and seven more from
   2026-10-02 to 2026-10-28, up to `7.2.13-200`). That was the most likely silent failure.
@@ -250,7 +273,7 @@ system/     what gets installed: shutdown hooks, scripts, units, logrotate
   bin/s5-descubre-dgpu   finds the dGPU via sysfs (no hardcoded paths)
 kmod/       module source (plain .c) + the akmod spec that packages it
 tools/      measurement and diagnostic instruments (install.sh --tools)
-tests/      101-branch test: verifier, uninstaller, device and GRUB-flavour
+tests/      114-branch test: verifier, uninstaller, device and GRUB-flavour
             detection and the rare-case policy — all with generated fixtures
 docs/       the evidence base
 ```

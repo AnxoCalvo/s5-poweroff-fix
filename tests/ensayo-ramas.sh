@@ -8,6 +8,7 @@
 #
 # QUE CUBRE
 #   9ter  ¿apago GRUB de verdad? (por los tiempos de ACPI FPDT)
+#   9quater  la rama de GRUB como costumbre: la racha de desvios y su causa
 #   10    la energia: cuando el umbral de vatios aplica y cuando hay que abstenerse
 #
 # POR QUE LOS FIXTURES SE GENERAN Y NO ESTAN GUARDADOS: las dos secciones
@@ -360,6 +361,20 @@ caso "noche entera desviada pero CARA => FALLA (la rama nueva no es un indulto)"
 caso "noche larga pero sin saber cuanto fue S5 (sin FPDT) => se abstiene sin inventarse la cifra" \
                                         'no se ha podido medir cuanto' "${DESVIO[@]}" "${ANCLA[@]}" ELOG="$F/e-noche.log" FPDT="$F/no-existe" ARRANQUE="$ARR_NOCHE"
 
+# VATIOS NEGATIVOS: la bateria marca MAS energia al encender que al apagar
+# (el medidor se recalibro, o se enchufo durante el apagado). El `sed` no
+# admitia el signo, devolvia la linea entera, y el 2026-11-19 el informe
+# imprimio "la ventana medida (          => APAGADO 10.52 h ... W)". La linea de
+# este fixture es LA DE ESA NOCHE, copiada de /var/log/s5-energy.log.
+{ echo "$APAG_TS  APAGADO     55.748 Wh   87%  Discharging  (bateria)"
+  echo "$(f $((FIN + 60)))  ARRANQUE    56.903 Wh   87%  Discharging  (bateria)"
+  echo "          => APAGADO 10.52 h a bateria: +1.155 Wh  =  -0.11 W medios en S5"
+} > "$F/e-negativo.log"
+caso "apagado normal con vatios NEGATIVOS => no puntuable, dicho con su signo" \
+                                        'marco -0.11 W: la bateria GANO energia' "${N[@]}" ELOG="$F/e-negativo.log"
+caso "desviado por GRUB con vatios NEGATIVOS => la ventana dice -0.11 W, no la linea entera" \
+                                        'la ventana medida \(-0\.11 W\)' "${G[@]}" "${ANCLA[@]}" ELOG="$F/e-negativo.log"
+
 # LOS REINICIOS. s5-energy-log apunta APAGADO tambien al reiniciar, y el
 # 2026-10-29 un reinicio de 47 s salio como "40.14 W ... CUELGUE". Quien sabe que
 # parada fue es la cabecera del hook 99 (`accion=reboot  kernel=`), unos segundos
@@ -709,6 +724,86 @@ else
     unset _o
 fi
 chmod 755 "$F/sinpermiso/grub2"   # que el `rm -rf` del final pueda con el
+
+echo
+echo "9quater — la red de seguridad como costumbre (la serie que no miraba nadie)"
+# Del 2026-11-12 al 2026-11-19 la rama de GRUB salto en LOS OCHO apagados de esta
+# maquina (kernel 7.3 + driver NVIDIA: runtime D3 desactivado sin decir nada), y
+# el verificador dijo "TODO EN ORDEN" las ocho veces: cada noche por separado
+# estaba bien. Ahora se cuenta la racha y, a partir de 3, se avisa y se dice cual
+# de las dos causas es, con los contadores de runtime PM del hook 99.
+#
+# LA SECUENCIA ES UN PARAMETRO, del bloque mas viejo al mas nuevo:
+#   N  la dGPU se durmio sola (apagado normal)     R  desvio por GRUB
+#   D  ENSAYO EN SECO que tampoco vio caer la dGPU (dryrun=1: ni cuenta ni corta;
+#      dice "NO cayo" a proposito, para que contarlo por error se note)
+#   U  bloque real SIN decision (la cortaron a media espera: corta la racha)
+pol_cayo() {
+    cat <<EOF
+===== $1  POLITICA GPU  dryrun=0  maxwait=90s  root=rw boot=DESMONTADO
+POLITICA dGPU despierta al entrar: dGPU=D0/active audio=D3hot/suspended puente=D0/active — esperando hasta 90s
+POLITICA la dGPU cayo sola en 9.5s (traza: 0:D0 8.5:D3hot 9.5:D3cold) => apagado normal (~2 W)
+EOF
+}
+# La cabecera del hook 99 con las tres lineas CLAVE en el orden del hook de
+# verdad (puente, GPU, audio). EL PUENTE LLEVA LOS CONTADORES AL REVES QUE LA
+# GPU a proposito: si el diagnostico leyera la linea equivocada, diria lo
+# contrario y el caso lo cazaria.
+clave99() {  # clave99 <fecha> <suspendido_ms de la dGPU> <activo_ms de la dGPU>
+    local bs=0 ba=48284705
+    [ "$2" = 0 ] && { bs=777000; ba=47507705; }
+    cab99 "$1" reboot
+    printf 'CLAVE 0000:00:01.1  power_state=D0      runtime_status=active     driver=pcieport      d3cold_allowed=1 control=auto suspendido_ms=%s activo_ms=%s\n' "$bs" "$ba"
+    printf 'CLAVE 0000:01:00.0  power_state=D0      runtime_status=active     driver=nvidia        d3cold_allowed=1 control=auto suspendido_ms=%s activo_ms=%s\n' "$2" "$3"
+    printf 'CLAVE 0000:01:00.1  power_state=D3hot   runtime_status=suspended  driver=snd_hda_intel d3cold_allowed=1 control=auto suspendido_ms=88307038 activo_ms=25549\n'
+}
+mk_racha() {  # mk_racha <fichero> "<N|R|D|U ...>" [suspendido_ms activo_ms [s hasta la cabecera del hook]]
+    local fich="$1" seq="$2" susp="${3-}" act="${4-}" tras="${5:-92}" i=0 t=0 b
+    : > "$fich"
+    for b in $seq; do
+        i=$((i+1)); t=$((FIN - (10 - i) * 86400))   # un apagado por dia, hasta 9
+        case "$b" in
+            N) pol_cayo "$(f $t)" ;;
+            R) pol_grub "$(f $t)" ;;
+            D) printf '===== %s  POLITICA GPU  dryrun=1  maxwait=2s  root=rw boot=rw\nPOLITICA !!! la dGPU NO cayo a D3cold en 2.0s (traza: 0:D0)\n' "$(f $t)" ;;
+            U) printf '===== %s  POLITICA GPU  dryrun=0  maxwait=90s  root=rw boot=DESMONTADO\nPOLITICA dGPU despierta al entrar: dGPU=D0/active — esperando hasta 90s\n' "$(f $t)" ;;
+        esac >> "$fich"
+    done
+    [ -n "$susp" ] && clave99 "$(f $((t + tras)))" "$susp" "$act" >> "$fich"
+    return 0
+}
+printf '#!/bin/sh\nGPU=0000:01:00.0; AUDIO=0000:01:00.1; BRIDGE=0000:00:01.1\n' > "$F/descubre-fijo"
+mk_racha "$F/racha-3.log"        "N R R R"
+mk_racha "$F/racha-2.log"        "N R R"
+mk_racha "$F/racha-cortada.log"  "R R R N"
+mk_racha "$F/racha-ensayo.log"   "R R D R"
+mk_racha "$F/racha-sin-dec.log"  "R U R R"
+mk_racha "$F/racha-nunca.log"    "N R R R" 0 48284705          # 13,4 h sin suspenderse ni una vez
+mk_racha "$F/racha-en-uso.log"   "N R R R" 596945 120296       # se suspendia: algo la uso al apagar
+mk_racha "$F/racha-lejos.log"    "N R R R" 0 48284705 700      # cabecera de otra parada
+mk_racha "$F/racha-corta.log"    "N R R R" 0 240000            # 4 min de sesion: no se afirma nada
+RA=(ELOG="$F/e-bajo.log" FPDT="$F/fpdt-ok" ARRANQUE="$ARR_APAGO" S5_DESCUBRE="$F/no-existe")
+RD=(ELOG="$F/e-bajo.log" FPDT="$F/fpdt-ok" ARRANQUE="$ARR_APAGO" S5_DESCUBRE="$F/descubre-fijo")
+avisocaso "tres desvios SEGUIDOS => AVISA, con la racha y desde cuando" \
+    '\[AVISO\].*la red de seguridad lleva 3 apagados SEGUIDOS' "${RA[@]}" PCILOG="$F/racha-3.log"
+avisocaso "dos seguidos => se calla (un monitor externo dos noches es plausible)" \
+    '!red de seguridad lleva' "${RA[@]}" PCILOG="$F/racha-2.log"
+avisocaso "tres desvios pero el ULTIMO se durmio sola => la racha esta cortada, se calla" \
+    '!red de seguridad lleva' "${RA[@]}" PCILOG="$F/racha-cortada.log"
+avisocaso "un ENSAYO EN SECO en medio ni cuenta ni corta => lleva 3, no 4 ni 1" \
+    'red de seguridad lleva 3 apagados' "${RA[@]}" PCILOG="$F/racha-ensayo.log"
+avisocaso "un bloque real SIN decision corta la racha => 2, se calla (ante la duda no se avisa)" \
+    '!red de seguridad lleva' "${RA[@]}" PCILOG="$F/racha-sin-dec.log"
+avisocaso "13 h de sesion sin suspenderse NI UNA VEZ => dice que es el runtime PM, no un uso" \
+    'no se suspendio NI UNA VEZ.*Runtime D3 status' "${RD[@]}" PCILOG="$F/racha-nunca.log"
+avisocaso "la dGPU SI se suspendia durante la sesion => apunta a algo que la usaba al apagar" \
+    'si se suspendia durante la sesion' "${RD[@]}" PCILOG="$F/racha-en-uso.log"
+avisocaso "cabecera del hook a 700 s => es de otra parada, no se diagnostica con ella" \
+    '!NI UNA VEZ|si se suspendia' "${RD[@]}" PCILOG="$F/racha-lejos.log"
+avisocaso "sesion de 4 min sin suspenderse => demasiado corta para afirmar nada" \
+    '!NI UNA VEZ|si se suspendia' "${RD[@]}" PCILOG="$F/racha-corta.log"
+avisocaso "sin BDF de la dGPU => avisa, pero no diagnostica a ciegas" \
+    '!NI UNA VEZ|si se suspendia' "${RA[@]}" PCILOG="$F/racha-nunca.log"
 
 echo
 echo "9 — el recuento del blindaje NO puede ser una constante"
@@ -1197,6 +1292,18 @@ politica "armado: la politica se dio por armada en el log" \
 cp "$F/pol/log" "$F/pol-real-armado.log"
 audita_rama_grub "...y el verificador, sobre ese log REAL, da por buena la rama de GRUB" \
     'consiguio /boot en rw por su cuenta' "$F/pol-real-armado.log"
+# §9quater cuenta la racha sobre frases EXACTAS de la politica (la cabecera con
+# dryrun=0 y "!!! la dGPU NO cayo"). Los fixtures de mk_racha las copian a mano;
+# esto comprueba que la politica de verdad las sigue escribiendo asi.
+n=$((n+1))
+cat "$F/pol-real-armado.log" "$F/pol-real-armado.log" "$F/pol-real-armado.log" > "$F/pol-real-racha.log"
+if env PCILOG="$F/pol-real-racha.log" ELOG="$F/e-bajo.log" S5_DESCUBRE="$F/no-existe" bash "$CHK" 2>&1 \
+       | grep -q 'red de seguridad lleva 3 apagados SEGUIDOS'; then
+    printf '  [ok]    %s\n' "...y tres apagados REALES asi seguidos => §9quater cuenta la racha"
+else
+    printf '  [MAL]   %s\n' "...y tres apagados REALES asi seguidos => §9quater NO cuenta la racha"
+    malas=$((malas+1))
+fi
 politica "fallback: systemctl --force reboot no vuelve (shim) => cae a reboot -f" \
     '[ -s "$F/pol/reboot.log" ] && grep -q "^reboot -f$" "$F/pol/reboot.log"'
 politica "fallback: antes de reboot -f se intenta remontar / en ro" \

@@ -56,6 +56,7 @@ ELOG=${ELOG:-/var/log/s5-energy.log}             # overridable SOLO para ensayar
 MARKER=/var/lib/s5-test/mitigacion-ROTA
 KVER="$(uname -r)"
 UMBRAL_W=4          # por encima de esto, el apagado anterior NO estuvo mitigado
+RACHA_GRUB=3        # desvios por GRUB SEGUIDOS a partir de los cuales se avisa (§9quater)
 # LOS HOOKS QUE INSTALA ESTE PROYECTO. La regla 17 nacio de un `*.bak-*` de uno
 # de ESTOS que se quedo en el directorio y sistemd lo ejecuto EN PARALELO con el
 # bueno, hundiendo un control. O sea que el peligro real es una copia suelta de
@@ -550,6 +551,73 @@ else
     fi
 fi
 
+# --- 9quater. ¿LA RED DE SEGURIDAD SE HA VUELTO LA NORMA? ---------------------
+# La rama de GRUB es un seguro para el caso raro, no el mecanismo: en tres meses
+# de apagados diarios solo salto cuando se la forzo a mano. Desde el 2026-11-12
+# salto en TODOS los apagados de esta maquina, ocho seguidos, y este informe los
+# fue despachando de uno en uno con "TODO EN ORDEN": cada noche por separado
+# estaba bien, y la serie no la miraba nadie. La causa (kernel 7.3 + driver
+# NVIDIA: el runtime D3 se queda desactivado sin una linea en el log,
+# open-gpu-kernel-modules#1507) tenia la dGPU despierta TODO EL DIA, no solo al
+# apagar. Se descubrio por lo que tardaba en apagarse, no por este informe.
+#
+# AVISO y no FALLO: el S5 sigue mitigado, la rama de GRUB hace su trabajo, asi
+# que ni mitigacion-ROTA ni `wall`. Pero se esta viviendo del seguro: cada
+# apagado paga 90 s de espera a ~19 W y un reinicio con POST, escribe en /boot,
+# y si esa rama fallara una noche lo que queda detras es el apagado de 19 W.
+#
+# Se cuentan los bloques REALES (dryrun=0) de la politica, del mas nuevo hacia
+# atras, mientras digan "la dGPU NO cayo". El primero en que se durmio sola
+# corta la racha; los ensayos en seco ni cuentan ni cortan. Un bloque SIN
+# decision (la cortaron a media espera) tambien corta: ante la duda no se avisa,
+# y ese caso ya tiene su FALLO en §9bis.
+#
+# Tres y no dos: dos noches seguidas con un monitor externo en la dGPU son
+# plausibles y no dicen nada que §9bis no haya dicho ya. Tres seguidas son una
+# costumbre, y entonces merece la pena saber cual de las dos causas es.
+RACHA=0; RACHA_DESDE=''; RACHA_HASTA=''
+while IFS='|' read -r ts r; do
+    [ "$r" = R ] || break
+    RACHA=$((RACHA+1)); RACHA_DESDE="$ts"; [ -n "$RACHA_HASTA" ] || RACHA_HASTA="$ts"
+done < <(awk '
+    /^===== / { if (n) print ts "|" r; n = 0 }
+    /^===== / && /POLITICA GPU/ && /dryrun=0/ { n = 1; ts = $2 " " $3; r = "U" }
+    n && /^POLITICA !!! la dGPU NO cayo/ { r = "R" }
+    n && /^POLITICA (sin riesgo|la dGPU cayo sola)/ { r = "N" }
+    END { if (n) print ts "|" r }
+' "$PCILOG" 2>/dev/null | tac)
+
+if [ "$RACHA" -ge "$RACHA_GRUB" ]; then
+    aviso "la red de seguridad lleva $RACHA apagados SEGUIDOS actuando (del $RACHA_DESDE al $RACHA_HASTA): la dGPU no se duerme sola y cada apagado sale por GRUB (90 s de espera a ~19 W + reinicio con POST). El S5 sigue mitigado, pero por la rama de reserva, no por el mecanismo principal"
+    # CUAL DE LAS DOS CAUSAS, que es lo que hace que el aviso sirva para algo. La
+    # cabecera del hook 99 de ESA parada (la politica cuelga de poweroff.target,
+    # el hook corre al final de systemd-shutdown: segundos despues) trae los
+    # contadores de runtime PM de la dGPU de TODA la sesion. Si en mas de 10 min
+    # no se suspendio ni una vez, no es que algo la usara al apagar: es que su
+    # runtime PM no actua. Sin BDF, sin cabecera o con una a mas de 600 s (de
+    # otra parada) no se dice nada — no se diagnostica con datos de otra sesion.
+    clave="$(awk -v t="$RACHA_HASTA" -v gpu="$GPU" '
+        /^===== / && /POLITICA GPU/ && ($2 " " $3) == t { vista = 1; next }
+        vista && !cab && /^===== [0-9-]+ [0-9:]+  accion=[a-z]+  kernel=/ { cab = $2 " " $3; next }
+        cab && /^===== / { exit }
+        cab && $1 == "CLAVE" && $2 == gpu { print cab "|" $0; exit }
+    ' "$PCILOG" 2>/dev/null)"
+    if [ -n "$GPU" ] && [ -n "$clave" ]; then
+        IFS='|' read -r cts cline <<< "$clave"
+        cep="$(ep "$cts")"; rep="$(ep "$RACHA_HASTA")"
+        susp="$(printf '%s' "$cline" | sed -nE 's/.* suspendido_ms=([0-9]+)( .*)?$/\1/p')"
+        act="$(printf '%s' "$cline" | sed -nE 's/.* activo_ms=([0-9]+)( .*)?$/\1/p')"
+        if [ -n "$cep" ] && [ -n "$rep" ] && [ "$cep" -ge "$rep" ] && [ $((cep - rep)) -le 600 ] \
+           && [ -n "$susp" ] && [ -n "$act" ]; then
+            if [ "$susp" = 0 ] && [ "$act" -ge 600000 ]; then
+                di "  [ -- ]     en la sesion que acabo en el ultimo desvio ($(dur $((act / 1000))) con la dGPU activa) no se suspendio NI UNA VEZ: no es que algo la usara al apagar, es que su runtime PM no actua. Con NVIDIA y kernel 7.3 o posterior, mira 'Runtime D3 status' en /proc/driver/nvidia/gpus/$GPU/power (bug del driver: open-gpu-kernel-modules#1507)"
+            elif [ "$susp" -gt 0 ]; then
+                di "  [ -- ]     la dGPU si se suspendia durante la sesion ($(dur $((susp / 1000))) suspendida): algo la tenia despierta al apagar (monitor externo en la dGPU, CUDA, PRIME offload)"
+            fi
+        fi
+    fi
+fi
+
 # --- 10. lo unico que discrimina de verdad: la energia (regla 3) ------------
 # OJO AL `tail -1`: hay que mirar el resumen del ULTIMO APAGADO, no el ultimo
 # resumen que traiga vatios. Lo de antes hacia `grep 'W medios en S5' | tail -1`
@@ -683,7 +751,16 @@ if [ "$grubwin" = 1 ] && [ -n "$S5_REAL_S" ]; then
     fi
 fi
 
-w="$(printf '%s' "$med" | sed -E 's/.*=  *([0-9.]+) W medios.*/\1/')"
+# EL SIGNO TAMBIEN SE LEE. s5-energy-log escribe vatios NEGATIVOS cuando la
+# bateria marca mas energia al encender que al apagar, y en el historial de esta
+# maquina hay dos causas: el medidor se recalibro con el equipo apagado (seis
+# noches, hasta +2,448 Wh) o se enchufo el cargador DURANTE el apagado (el
+# 2026-08-08: +20,497 Wh, "-31.03 W"; el log solo sabe si estaba enchufado al
+# APAGAR). Con `([0-9.]+)` el `sed` no casaba, devolvia la LINEA ENTERA y el
+# informe del 2026-11-19 imprimio "la ventana medida (          => APAGADO
+# 10.52 h ... W)". En un apagado normal era peor: un aviso de "no se pudo leer
+# el vataje" por una linea que se habia leido perfectamente.
+w="$(printf '%s' "$med" | sed -E 's/.*=  *(-?[0-9.]+) W medios.*/\1/')"
 if [ "$reinicios" -gt 0 ] && [ -n "$med" ]; then
     di "  [ -- ]   despues hubo $reinicios reinicio(s) (el ultimo, $ult_reinicio): un reinicio no pasa por S5, asi que se mide el apagado anterior ($medts)"
 fi
@@ -706,7 +783,14 @@ elif [ "$grubwin" = 1 ]; then
 else
     [ "$grubwin" = 2 ] && \
         di "  [ -- ]   el apagado se desvio por GRUB ($POL_GRUB_TS), pero el S5 real cubrio el ${S5_FRAC}% de la ventana ($(dur "$S5_REAL_S")): la medida SI vale, y es un techo (la maniobra solo puede subirla)"
-    if ! printf '%s' "$w" | grep -qE '^[0-9]+(\.[0-9]+)?$'; then
+    # Negativo = la bateria GANO energia apagada: el numero es del medidor o del
+    # cargador, no del S5. No puntuable, y por eso tampoco aprueba — con el
+    # cargador puesto cabe debajo cualquier consumo. Se trata igual que el
+    # apagado ENCHUFADO de arriba: se dice, sin aviso, porque no es un fallo de
+    # la mitigacion sino una ventana que no mide nada.
+    if printf '%s' "$w" | grep -qE '^-[0-9]+(\.[0-9]+)?$'; then
+        di "  [ -- ]   el ultimo apagado marco $w W: la bateria GANO energia con el equipo apagado (el medidor se recalibro, o se enchufo durante el apagado), asi que no mide el S5 (no puntuable)"
+    elif ! printf '%s' "$w" | grep -qE '^[0-9]+(\.[0-9]+)?$'; then
         aviso "no se pudo leer el vataje del ultimo apagado: $med"
     elif awk -v w="$w" 'BEGIN{exit !(w+0 > 30)}'; then
         # Regla 4: 30-65 W es la maquina DESPIERTA, o sea un cuelgue. No es una
